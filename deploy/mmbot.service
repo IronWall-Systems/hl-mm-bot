@@ -1,0 +1,40 @@
+# hl-mm-bot systemd unit — TESTNET ONLY (mainnet forbidden: see .agent/RULES.md rule 1)
+# FILE ONLY. The agent never installs this (install needs sudo = NEEDS HUMAN,
+# see .agent/RUNBOOK.md).
+#
+# *** READ BEFORE INSTALL (NEEDS HUMAN) ***
+# 1. User=mmbot cannot traverse /root (dr-xr-x--- root root), so WorkingDirectory and the
+#    Exec* paths below (/root/hl-mm-bot/...) will fail for a non-root User=. Before enabling,
+#    either relocate the checkout to a path mmbot can reach (e.g. /opt/hl-mm-bot) and update
+#    every path here, or fix permissions yourself. The agent does not create users or touch
+#    system files/permissions.
+# 2. /etc/mmbot/mmbot.env must exist, mode 600, and contain HL_ENV=testnet (never mainnet),
+#    HL_ACCOUNT_ADDRESS, HL_API_SECRET, HL_DRY_RUN, HL_COIN, MM_*/RISK_* as chosen.
+# 3. The bot's kill switch exits with code 2 (main.py run()). RestartPreventExitStatus=2 below
+#    stops systemd from auto-restarting a KILLED bot (a silent resume with reset peak-equity
+#    would weaken the kill switch). Crashes and other failures still restart via Restart=on-failure.
+# 4. ExecStopPost=panic runs after EVERY stop, including failed starts; panic ignores
+#    HL_DRY_RUN by design (it always cancels all + flattens).
+
+[Unit]
+Description=Hyperliquid Alo market-maker (hl-mm-bot, TESTNET ONLY)
+Documentation=file:///root/hl-mm-bot/BUILD_SPEC.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mmbot
+WorkingDirectory=/root/hl-mm-bot
+EnvironmentFile=/etc/mmbot/mmbot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/hl-mm-bot/.venv/bin/python -m mmbot.main
+ExecStopPost=/root/hl-mm-bot/.venv/bin/python -m mmbot.panic
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+MemoryMax=800M
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

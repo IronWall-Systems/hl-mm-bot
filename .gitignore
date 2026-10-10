@@ -1,0 +1,43 @@
+# ---- secrets / environment (CRITICAL) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+
+# ---- runtime market data / logs (never commit) ----
+data/
+logs/
+*.jsonl
+*.jsonl.gz
+collector_pid.txt
+*.pid
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# ---- tooling caches ----
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- agent / internal working notes ----
+.agent/
+
+# ---- editors / os ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

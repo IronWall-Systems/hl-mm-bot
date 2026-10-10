@@ -1,0 +1,3 @@
+hyperliquid-python-sdk==0.24.0   # version whose signatures were inspected; pin and re-verify before upgrading
+eth-account>=0.10
+pytest>=8.0

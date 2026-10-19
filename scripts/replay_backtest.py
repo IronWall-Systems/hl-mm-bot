@@ -3,15 +3,20 @@
 
 Reads `data/YYYYMMDD/HH_<COIN>.jsonl.gz` shards (or the members of `data_YYYYMMDD.tar`
 archives) and replays them through the *real* quoter (`src/mmbot/strategy/quoter.py`
-`compute_quotes`) with latency, ALO clamping and a top-of-book queue model.
+`compute_quotes`) with latency, ALO clamping and a top-of-book queue model. Tar archives are
+now discovered TRANSPARENTLY: any `data_YYYYMMDD.tar` in `--archive-dir` (default
+`/root/gdrive_backup/hl-datasets`, env `HL_MM_ARCHIVE_DIR`) fills hours that are not present
+locally, with no double counting (local > explicit `--tar` > auto archive); `--no-auto-tar`
+disables it. `gather_sources()` exposes the same behaviour to the T16 evaluator.
 
 Time model
 ----------
-* Records carry only the exchange stamp ``t`` (ms). The collector did NOT record a
-  receive stamp, so the bot's view time is modelled as ``t_seen = t + feed_age_s``
-  (``--feed-age-ms``, default 400 — UNVERIFIED, sized from the T7d fast-book mainnet
-  measurements, A-16..A-18). If a record ever carries ``"r"`` (recv unix seconds) the
-  real feed age is measured from it and reported instead.
+* Records carry the exchange stamp ``t`` (ms). Collector v2 (T15) also writes a local
+  receive stamp ``"r"`` (epoch **ms**) on every event line: when present the bot's view
+  time is ``t_seen = t + (r - t)/1000`` — the TRUE recorded feed age. For legacy shards
+  without ``"r"`` the age falls back to ``--feed-age-ms`` (default 400 — UNVERIFIED,
+  sized from the T7d fast-book mainnet measurements, A-16..A-18); the median/p90 of the
+  measured ages are still reported.
 * An order/cancel decided at ``t_seen`` reaches the exchange at
   ``t_eff = t_seen + latency_ms/1000`` and only interacts with trades at or after
   ``t_eff`` — no look-ahead.
@@ -31,6 +36,29 @@ Fills, traded volume (USD), gross spread captured (edge vs mid at fill, USD + bp
 maker fees (1.5 bps/fill default), 1s/5s/30s mid markouts (bps), net PnL (USD + bps),
 feed-age median/p90 (ms; "n/a" when the shard carries no recv stamp).
 
+PnL decomposition (T13)
+-----------------------
+Net PnL is split strictly (FIFO lot matching, exact identities):
+
+* ``round_trip_spread_pnl`` = matched_gross − fees_matched — spread realised on
+  buy/sell pairs fully matched FIFO, net of maker fees on both matched legs.
+* ``inventory_mtm_pnl``     = pos × final_mid − residual_basis — mark-to-market of
+  the unmatched residual inventory (lot basis vs final mid), i.e. the directional
+  drift component (lucky/unlucky inventory, NOT spread capture).
+* ``total_fees_usd``        = maker fees on every fill (= ``maker_fees_usd``).
+* ``funding_pnl``           = accrued perpetual funding, ``-pos × mark × rate`` once per
+  UTC hour from collector ``e=funding`` records (0 when none are present).
+
+Identities (verified by unit tests)::
+
+    net_pnl_usd = matched_spread_usd + inventory_mtm_pnl + funding_pnl − total_fees_usd
+                = round_trip_spread_pnl + inventory_mtm_pnl + funding_pnl − fees_unmatched_usd
+    total_fees_usd = fees_matched_usd + fees_unmatched_usd
+
+``gross_spread_bps`` is an execution-quality metric (edge vs contemporaneous mid at
+each fill, unmatched) and is NOT a component of net PnL — it can be negative while
+net PnL is positive purely via ``inventory_mtm_pnl`` (the T13 audit question).
+
 This script is research-only: it never imports credentials, never touches the network
 and never places orders.
 """
@@ -41,9 +69,11 @@ import csv
 import gzip
 import heapq
 import json
+import os
 import statistics
 import sys
 import tarfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -59,6 +89,16 @@ MAKER_FEE_BPS = 1.5
 MARKOUT_S = (1.0, 5.0, 30.0)
 MID_GRID_S = 0.05
 HOUR_MS = 3_600_000
+DEFAULT_ARCHIVE_DIR = Path(
+    os.environ.get("HL_MM_ARCHIVE_DIR", "/root/gdrive_backup/hl-datasets")
+)
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_hour_key(value: str) -> int:
@@ -80,15 +120,24 @@ def hour_range(start: int, end: int) -> Iterator[tuple[str, str]]:
         yield s[:8], s[8:10]
         day, hh = int(s[:8]), int(s[8:10])
         if hh == 23:
-            day, hh = day + 1, 0
             y, m, d = day // 10000, (day // 100) % 100, day % 100
             import datetime
 
             nxt = datetime.date(y, m, d) + datetime.timedelta(days=1)
-            cur = nxt.year * 10000 + nxt.month * 100 + nxt.day
-            cur = cur * 100 + hh
+            cur = (nxt.year * 10000 + nxt.month * 100 + nxt.day) * 100
         else:
             cur = day * 100 + hh + 1
+
+
+def resolve_range(start_s: str, end_s: str) -> tuple[int, int]:
+    """Bare YYYYMMDD end keys expand to the last hour of that day (23)."""
+    start = parse_hour_key(start_s)
+    end = parse_hour_key(end_s)
+    if len(end_s.strip()) == 8:
+        end += 23
+    if end < start:
+        raise ValueError("end before start")
+    return start, end
 
 
 def load_specs(universe_path: Path) -> dict[str, AssetSpec]:
@@ -116,6 +165,62 @@ def tar_members(tar_path: Path, coin: str, start: int, end: int) -> list[tuple[P
     return out
 
 
+def discover_tars(
+    archive_dir: Path | None,
+    coin: str,
+    start: int,
+    end: int,
+) -> list[tuple[Path, str]]:
+    """Auto-discover `data_YYYYMMDD.tar` for the days in [start, end].
+
+    This makes offline replay transparent after `archive_data.py` has tarred a day and
+    removed its local `data/YYYYMMDD/` directory: pass the archive directory once and the
+    tar members are read exactly like local shards. Missing directory / missing tar for a
+    day yields nothing (never raises), so a partially archived dataset still works.
+    """
+    if archive_dir is None:
+        return []
+    archive_dir = Path(archive_dir)
+    if not archive_dir.is_dir():
+        return []
+    out: list[tuple[Path, str]] = []
+    for day in sorted({day for day, _ in hour_range(start, end)}):
+        tar_path = archive_dir / f"data_{day}.tar"
+        if tar_path.is_file():
+            out.extend(tar_members(tar_path, coin, start, end))
+    return out
+
+
+def gather_sources(
+    data_dir: Path,
+    coin: str,
+    start: int,
+    end: int,
+    *,
+    archive_dir: Path | None = None,
+    explicit_tars: Iterable[tuple[Path, str]] = (),
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Return (local shard paths, tar members) covering [start, end] with NO double count.
+
+    Precedence per (day, hour): local shard > explicit `--tar` member > auto-discovered
+    archive tar member. This lets the T16 evaluator (and `replay_backtest.main`) read a
+    dataset that is partly local and partly archived without knowing which is which.
+    """
+    paths = shard_paths(Path(data_dir), coin, start, end)
+    covered = {(p.parent.name, p.name[:2]) for p in paths}
+    tars: list[tuple[Path, str]] = []
+    candidates = list(explicit_tars) + discover_tars(archive_dir, coin, start, end)
+    for tar_path, member in candidates:
+        if "/" not in member:
+            continue
+        day, name = member.split("/", 1)
+        if len(name) < 2 or (day, name[:2]) in covered:
+            continue
+        covered.add((day, name[:2]))
+        tars.append((Path(tar_path), member))
+    return paths, tars
+
+
 def _lines_from_gz_stream(fh) -> Iterator[str]:
     for raw in fh:
         line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
@@ -129,32 +234,44 @@ def iter_records(
     tars: list[tuple[Path, str]],
     coin: str,
 ) -> Iterator[dict]:
-    """Yield compact records for `coin` in arrival (file) order."""
+    """Yield compact records for `coin` in arrival (file) order.
+
+    Truncated gzip shards (the Oct-9 16:00Z outage left hour-15 files half
+    written) yield every record that decompresses, then a warning — the rest of
+    the dataset continues.
+    """
     for p in paths:
-        with gzip.open(p, "rt", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if rec.get("c") == coin:
-                    yield rec
-    for tar_path, member in tars:
-        with tarfile.open(tar_path, "r") as tar:
-            fh = tar.extractfile(member)
-            if fh is None:
-                continue
-            with gzip.GzipFile(fileobj=fh, mode="rb") as gz:
-                for line in _lines_from_gz_stream(gz):
+        try:
+            with gzip.open(p, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
                         rec = json.loads(line)
                     except ValueError:
                         continue
                     if rec.get("c") == coin:
                         yield rec
+        except (EOFError, gzip.BadGzipFile, OSError) as exc:
+            print(f"warning: truncated shard {p}: {exc}", file=sys.stderr)
+    for tar_path, member in tars:
+        with tarfile.open(tar_path, "r") as tar:
+            fh = tar.extractfile(member)
+            if fh is None:
+                continue
+            try:
+                with gzip.GzipFile(fileobj=fh, mode="rb") as gz:
+                    for line in _lines_from_gz_stream(gz):
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("c") == coin:
+                            yield rec
+            except (EOFError, gzip.BadGzipFile, OSError) as exc:
+                print(f"warning: truncated tar member {tar_path}:{member}: {exc}",
+                      file=sys.stderr)
 
 
 @dataclass
@@ -164,6 +281,7 @@ class Fill:
     px: float
     sz: float
     mid: float
+    markouts: dict[float, float] | None = None
 
 
 @dataclass
@@ -225,6 +343,14 @@ class ReplayEngine:
         self.exch_ts = 0.0
         self.last_recv_ts: float | None = None
         self.feed_ages_ms: list[float] = []
+        self.current_feed_age_s = self.feed_age_s
+
+        # v2 funding state (accrued once per UTC hour from `e=funding` records)
+        self.funding_pnl = 0.0
+        self.funding_samples = 0
+        self._last_funding_hour: int | None = None
+        self._last_funding_rate = 0.0
+        self._last_funding_mark = 0.0
 
         self.pos = 0.0
         self.working: dict[str, WorkingOrder | None] = {"buy": None, "sell": None}
@@ -232,6 +358,9 @@ class ReplayEngine:
         self.pending_place: dict[str, tuple[float, float] | None] = {"buy": None, "sell": None}
         self.pending_cancel: dict[str, bool] = {"buy": False, "sell": False}
         self._seq = 0
+        self.markout_horizon_s = max(MARKOUT_S)
+        self._open_fills: list[Fill] = []
+        self._since_prune = 0
 
         self.fills: list[Fill] = []
         self.stats = EngineStats()
@@ -239,6 +368,15 @@ class ReplayEngine:
         self.last_decay_t = 0.0
         self.mid_grid: dict[int, tuple[float, float]] = {}
         self.last_mid = 0.0
+
+        # T13 PnL decomposition state
+        self._open_lots: deque[list] = deque()  # [side, px, remaining_sz] FIFO
+        self.matched_gross_usd = 0.0
+        self.matched_buy_notional = 0.0
+        self.matched_sell_notional = 0.0
+        self.fees_matched_usd = 0.0
+        self.round_trip_count = 0
+        self.max_abs_inventory_usd = 0.0
 
     # ------------------------------------------------------------------ book
     @property
@@ -292,6 +430,10 @@ class ReplayEngine:
         if m > 0:
             self.last_mid = m
             self.mid_grid[int(self.exch_ts / MID_GRID_S)] = (self.exch_ts, m)
+            if self.pos != 0.0:
+                v = abs(self.pos * m)
+                if v > self.max_abs_inventory_usd:
+                    self.max_abs_inventory_usd = v
 
     def mid_at(self, t: float) -> float:
         key = int(t / MID_GRID_S)
@@ -366,6 +508,9 @@ class ReplayEngine:
 
     # ---------------------------------------------------------------- events
     def on_record(self, rec: dict) -> None:
+        ev = rec.get("e")
+        if ev in ("header", "gap"):
+            return
         t_ms = rec.get("t")
         if not isinstance(t_ms, (int, float)):
             return
@@ -373,18 +518,32 @@ class ReplayEngine:
         self.exch_ts = t
         recv = rec.get("r")
         if isinstance(recv, (int, float)):
+            age_ms = float(recv) - float(t_ms)  # both epoch ms (collector v2)
+            if age_ms < 0:
+                age_ms = 0.0
             self.last_recv_ts = float(recv)
-            self.feed_ages_ms.append((float(recv) - t) * 1000.0)
+            self.feed_ages_ms.append(age_ms)
+            self.current_feed_age_s = age_ms / 1000.0
+        else:
+            self.current_feed_age_s = self.feed_age_s
         self._advance_to(t)
-        ev = rec.get("e")
         if ev == "l2":
             self._on_l2(t, rec)
         elif ev == "bbo":
             self._on_bbo(t, rec)
         elif ev == "tr":
             self._on_trade(t, rec)
+        elif ev == "funding":
+            self._on_funding(t, rec)
+            self._decay_queues(t)
+            return
         else:
             return
+        self._settle_markouts(t)
+        self._since_prune += 1
+        if self._since_prune >= 2000:
+            self._since_prune = 0
+            self._prune_grid(t)
         self._decay_queues(t)
         self._maybe_decide(t)
 
@@ -424,8 +583,60 @@ class ReplayEngine:
         self._record_mid()
 
     def _fill(self, side: str, px: float, sz: float) -> None:
-        self.fills.append(Fill(self.exch_ts, side, px, sz, self.mid))
+        f = Fill(self.exch_ts, side, px, sz, self.mid)
+        self.fills.append(f)
+        self._open_fills.append(f)
+        self._match_fifo(side, px, sz)
         self.pos += sz if side == "buy" else -sz
+        if self.last_mid > 0:
+            v = abs(self.pos * self.last_mid)
+            if v > self.max_abs_inventory_usd:
+                self.max_abs_inventory_usd = v
+
+    def _match_fifo(self, side: str, px: float, sz: float) -> None:
+        """Consume opposite-side open lots FIFO; leftover becomes a new lot.
+
+        Records matched notionals and the maker fees belonging to matched legs
+        so the strict PnL identities in `compute_metrics` hold exactly.
+        """
+        fee_rate = self.maker_fee_bps / 1e4
+        remaining = sz
+        lots = self._open_lots
+        while remaining > 1e-12 and lots and lots[0][0] != side:
+            lot = lots[0]
+            m = min(remaining, lot[2])
+            if lot[0] == "buy":
+                self.matched_buy_notional += lot[1] * m
+                self.matched_sell_notional += px * m
+            else:
+                self.matched_buy_notional += px * m
+                self.matched_sell_notional += lot[1] * m
+            self.matched_gross_usd += (px - lot[1]) * m if lot[0] == "buy" else (lot[1] - px) * m
+            self.fees_matched_usd += (lot[1] + px) * m * fee_rate
+            self.round_trip_count += 1
+            lot[2] -= m
+            remaining -= m
+            if lot[2] <= 1e-12:
+                lots.popleft()
+        if remaining > 1e-12:
+            lots.append([side, px, remaining])
+
+    def _settle_markouts(self, t: float) -> None:
+        while self._open_fills and self._open_fills[0].t + self.markout_horizon_s <= t:
+            f = self._open_fills.pop(0)
+            f.markouts = {}
+            for secs in MARKOUT_S:
+                m = self.mid_at(f.t + secs)
+                if m > 0:
+                    edge = (m - f.px) if f.side == "buy" else (f.px - m)
+                    f.markouts[secs] = edge / f.px * 1e4
+
+    def _prune_grid(self, t: float) -> None:
+        cutoff = int((t - (self.markout_horizon_s + 2 * MID_GRID_S)) / MID_GRID_S)
+        if cutoff <= 0:
+            return
+        for k in [k for k in self.mid_grid if k < cutoff]:
+            del self.mid_grid[k]
 
     def _on_trade(self, t: float, rec: dict) -> None:
         self.stats.trades_seen += 1
@@ -451,13 +662,41 @@ class ReplayEngine:
         else:
             w.queue_ahead -= sz
 
+    def _on_funding(self, t: float, rec: dict) -> None:
+        """Accrue perpetual funding once per UTC hour.
+
+        Hyperliquid charges funding hourly. A collector `e=funding` record carries the
+        current hourly ``funding`` rate and ``mark_px``. The first sample anchors the hour
+        (no accrual); when the hour bucket advances we charge the *previous* hour's last
+        observed rate over ``hours`` elapsed at the position held then::
+
+            funding_pnl += -position_sz * mark_px * funding_rate
+
+        (long pays when the rate is positive). Missing ``mark_px`` falls back to the last
+        mid. This is an hourly step model — within-hour position changes are not split.
+        """
+        rate = _as_float(rec.get("funding"))
+        mark = _as_float(rec.get("mark_px"))
+        if mark is None or mark <= 0:
+            mark = self.last_mid
+        if rate is None or mark <= 0:
+            return
+        hour = int(t // 3600)
+        if self._last_funding_hour is not None and hour > self._last_funding_hour:
+            hours = hour - self._last_funding_hour
+            self.funding_pnl += -self.pos * self._last_funding_mark * self._last_funding_rate * hours
+        self._last_funding_hour = hour
+        self._last_funding_rate = rate
+        self._last_funding_mark = mark
+        self.funding_samples += 1
+
     # -------------------------------------------------------------- strategy
     def _maybe_decide(self, t: float) -> None:
-        m = self.market_state(t + self.feed_age_s)
-        if not m.is_valid:
-            return
-        seen_t = t + self.feed_age_s
+        seen_t = t + self.current_feed_age_s
         if seen_t - self.last_decision_seen < self.params.min_requote_interval_s:
+            return
+        m = self.market_state(seen_t)
+        if not m.is_valid:
             return
         self.last_decision_seen = seen_t
         self.stats.decisions += 1
@@ -496,6 +735,7 @@ class ReplayEngine:
 
     # --------------------------------------------------------------- results
     def compute_metrics(self, markouts: Iterable[float] = MARKOUT_S) -> dict:
+        self._settle_markouts(float("inf"))
         volume = sum(f.px * f.sz for f in self.fills)
         gross_usd = 0.0
         fees_usd = 0.0
@@ -508,7 +748,20 @@ class ReplayEngine:
         for f in self.fills:
             realized += f.px * f.sz if f.side == "sell" else -f.px * f.sz
         mid_last = self.last_mid
-        net_usd = realized + self.pos * mid_last - fees_usd
+        net_usd = realized + self.pos * mid_last + self.funding_pnl - fees_usd
+
+        # --- T13 strict decomposition (identities verified by unit tests) ---
+        residual_basis = sum(l[1] * l[2] for l in self._open_lots if l[0] == "buy") - sum(
+            l[1] * l[2] for l in self._open_lots if l[0] == "sell"
+        )
+        ending_inventory_usd = self.pos * mid_last
+        inventory_mtm_usd = ending_inventory_usd - residual_basis
+        fees_unmatched_usd = fees_usd - self.fees_matched_usd
+        round_trip_pnl_usd = self.matched_gross_usd - self.fees_matched_usd
+        end_inv_abs = abs(ending_inventory_usd)
+        if end_inv_abs > self.max_abs_inventory_usd:
+            self.max_abs_inventory_usd = end_inv_abs
+
         metrics = {
             "coin": self.spec.coin,
             "fills": len(self.fills),
@@ -518,6 +771,18 @@ class ReplayEngine:
             "maker_fees_usd": fees_usd,
             "net_pnl_usd": net_usd,
             "net_pnl_bps": (net_usd / volume * 1e4) if volume > 0 else 0.0,
+            "round_trip_spread_pnl": round_trip_pnl_usd,
+            "inventory_mtm_pnl": inventory_mtm_usd,
+            "funding_pnl": self.funding_pnl,
+            "funding_samples": self.funding_samples,
+            "funding_rate_last": self._last_funding_rate,
+            "matched_spread_usd": self.matched_gross_usd,
+            "fees_matched_usd": self.fees_matched_usd,
+            "fees_unmatched_usd": fees_unmatched_usd,
+            "total_fees_usd": fees_usd,
+            "round_trip_count": self.round_trip_count,
+            "max_abs_inventory_usd": self.max_abs_inventory_usd,
+            "ending_inventory_usd": ending_inventory_usd,
             "final_position": self.pos,
             "places": self.stats.places,
             "cancels": self.stats.cancels,
@@ -529,11 +794,9 @@ class ReplayEngine:
         for secs in markouts:
             vals = []
             for f in self.fills:
-                m = self.mid_at(f.t + secs)
-                if m <= 0:
+                if f.markouts is None or secs not in f.markouts:
                     continue
-                edge = (m - f.px) if f.side == "buy" else (f.px - m)
-                vals.append(edge / f.px * 1e4)
+                vals.append(f.markouts[secs])
             metrics[f"markout_{int(secs)}s_bps"] = statistics.fmean(vals) if vals else 0.0
         if self.feed_ages_ms:
             srt = sorted(self.feed_ages_ms)
@@ -568,6 +831,15 @@ MARKDOWN_ROWS = [
     ("Markout 30s (bps)", "markout_30s_bps", "{:+.3f}"),
     ("Net PnL (USD)", "net_pnl_usd", "{:+.4f}"),
     ("Net PnL (bps)", "net_pnl_bps", "{:+.3f}"),
+    ("Round-trip spread PnL (USD, after matched fees)", "round_trip_spread_pnl", "{:+.4f}"),
+    ("Inventory MTM PnL (USD)", "inventory_mtm_pnl", "{:+.4f}"),
+    ("Funding PnL (USD)", "funding_pnl", "{:+.4f}"),
+    ("Total fees (USD)", "total_fees_usd", "{:+.4f}"),
+    ("Fees on matched legs (USD)", "fees_matched_usd", "{:+.4f}"),
+    ("Fees on unmatched legs (USD)", "fees_unmatched_usd", "{:+.4f}"),
+    ("Round trips (FIFO matches)", "round_trip_count", "{:d}"),
+    ("Max |inventory| (USD)", "max_abs_inventory_usd", "{:,.4f}"),
+    ("Ending inventory (USD)", "ending_inventory_usd", "{:+.4f}"),
     ("Final position", "final_position", "{:+.6f}"),
     ("Places / cancels / ALO rejects", "place_cancel_alo", None),
     ("Feed age median (ms)", "feed_age_median_ms", "{:.1f}"),
@@ -599,7 +871,7 @@ def format_markdown(metrics: dict, args: argparse.Namespace) -> str:
             text = str(val)
         lines.append(f"| {label} | {text} |")
     note = (
-        "NOTE: t_seen = exchange t + fixed feed age (dataset has no recv stamp); "
+        "NOTE: t_seen = exchange t + fixed feed age (dataset has no recv stamp \"r\"); "
         "orders/cancels effective at t_seen + latency; queue = top-2 book levels "
         "with trade depletion"
     )
@@ -611,7 +883,11 @@ def format_markdown(metrics: dict, args: argparse.Namespace) -> str:
 CSV_KEYS = [
     "coin", "fills", "traded_volume_usd", "gross_spread_usd", "gross_spread_bps",
     "maker_fees_usd", "markout_1s_bps", "markout_5s_bps", "markout_30s_bps",
-    "net_pnl_usd", "net_pnl_bps", "final_position", "places", "cancels",
+    "net_pnl_usd", "net_pnl_bps", "round_trip_spread_pnl", "inventory_mtm_pnl",
+    "funding_pnl", "funding_samples", "funding_rate_last",
+    "matched_spread_usd", "fees_matched_usd", "fees_unmatched_usd", "total_fees_usd",
+    "round_trip_count", "max_abs_inventory_usd", "ending_inventory_usd",
+    "final_position", "places", "cancels",
     "alo_rejects", "decisions", "trades_seen", "book_updates",
     "feed_age_median_ms", "feed_age_p90_ms",
 ]
@@ -620,7 +896,7 @@ CSV_KEYS = [
 def write_csv(path: Path, rows: list[dict], args: argparse.Namespace) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "latency_ms", "half_spread_bps", "skew_bps", "cancel_rate", "feed_age_ms",
+        "latency_ms", "half_spread_bps", "skew_bps", "cancel_rate", "day", "feed_age_ms",
     ] + CSV_KEYS
     exists = path.exists() and path.stat().st_size > 0
     with path.open("a", newline="") as fh:
@@ -633,6 +909,7 @@ def write_csv(path: Path, rows: list[dict], args: argparse.Namespace) -> None:
                 "half_spread_bps": args.half_spread_bps,
                 "skew_bps": args.skew_bps,
                 "cancel_rate": args.cancel_rate,
+                "day": args.start,
                 "feed_age_ms": args.feed_age_ms,
             }
             row.update({k: m.get(k) for k in CSV_KEYS})
@@ -642,10 +919,14 @@ def write_csv(path: Path, rows: list[dict], args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Offline replay backtest over T10 collector shards")
     p.add_argument("--coin", required=True)
-    p.add_argument("--start", required=True, help="YYYYMMDD or YYYYMMDDHH")
-    p.add_argument("--end", required=True, help="YYYYMMDD or YYYYMMDDHH (inclusive)")
+    p.add_argument("--start", required=True, help="YYYYMMDD (whole day) or YYYYMMDDHH")
+    p.add_argument("--end", required=True, help="YYYYMMDD (whole day, inclusive) or YYYYMMDDHH")
     p.add_argument("--data-dir", default=str(PROJECT_ROOT / "data"))
     p.add_argument("--tar", action="append", default=[], help="data_YYYYMMDD.tar (repeatable)")
+    p.add_argument("--archive-dir", default=str(DEFAULT_ARCHIVE_DIR),
+                   help="directory auto-scanned for data_YYYYMMDD.tar (default %(default)s)")
+    p.add_argument("--no-auto-tar", action="store_true",
+                   help="do not auto-read data_YYYYMMDD.tar from --archive-dir")
     p.add_argument("--universe", default=str(PROJECT_ROOT / "data" / "universe.json"))
     p.add_argument("--latency-ms", type=float, default=500.0)
     p.add_argument("--half-spread-bps", type=float, default=4.0)
@@ -666,11 +947,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.coin not in specs:
         print(f"coin {args.coin} not in {args.universe}", file=sys.stderr)
         return 2
-    start, end = parse_hour_key(args.start), parse_hour_key(args.end)
-    paths = shard_paths(Path(args.data_dir), args.coin, start, end)
-    tars = []
+    start, end = resolve_range(args.start, args.end)
+    explicit = []
     for t in args.tar:
-        tars.extend(tar_members(Path(t), args.coin, start, end))
+        explicit.extend(tar_members(Path(t), args.coin, start, end))
+    paths, tars = gather_sources(
+        Path(args.data_dir),
+        args.coin,
+        start,
+        end,
+        archive_dir=None if args.no_auto_tar else Path(args.archive_dir),
+        explicit_tars=explicit,
+    )
     if not paths and not tars:
         print(f"no shards for {args.coin} in {args.start}..{args.end}", file=sys.stderr)
         return 2

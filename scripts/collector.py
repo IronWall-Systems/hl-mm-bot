@@ -17,6 +17,9 @@ Three compact schemas (one line each):
 Runtime guarantees
     * one connection, exponential reconnect backoff (1 s -> 60 s), a malformed message can
       never kill the process, SIGTERM/SIGINT shut it down cleanly;
+    * every 5 s the open shards are finalized (gzip end-of-stream written) and fsynced,
+      then reopened as an appended member, so a crash/reboot loses at most the last few
+      seconds instead of the whole hour and never leaves a truncated/0-byte shard;
     * `nice -n 10` at launch; own log logs/collector.log rotated at 5 MB x 3 files;
     * every 5 minutes, and only while free < 1 GiB, it spawns
       `archive_data.py --auto --apply` (that script refuses to run unless it needs to);
@@ -48,6 +51,9 @@ DEFAULT_COINS_JSON = DATA_DIR / "coins.json"
 ARCHIVE_SCRIPT = PROJECT_ROOT / "scripts" / "archive_data.py"
 
 WS_URL = "wss://api.hyperliquid.xyz/ws"
+INFO_URL = "https://api.hyperliquid.xyz/info"
+FUNDING_PAYLOAD = b'{"type":"metaAndAssetCtxs"}'
+SCHEMA_ID = "hlmm-shard/2"
 SUBSCRIPTIONS_PER_COIN = (
     {"type": "l2Book", "fast": True},
     {"type": "trades"},
@@ -68,6 +74,8 @@ PING_EVERY_S = 30.0
 RECV_TIMEOUT_S = 1.0
 STAT_EVERY_S = 60.0
 HOUSEKEEP_EVERY_S = 1.0
+FUNDING_EVERY_S = 60.0
+FLUSH_EVERY_S = 5.0
 
 
 class CollectorError(RuntimeError):
@@ -100,6 +108,65 @@ def load_coins(path: Path) -> list[str]:
     if not coins:
         raise CollectorError(f"{path} has no usable coin names")
     return coins
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_funding(doc, coins: list[str]) -> dict[str, dict]:
+    """`[meta, assetCtxs]` from POST {"type":"metaAndAssetCtxs"} -> per-coin funding fields.
+
+    Read-only REST shape (T10/T13): ``doc[0]["universe"][i]["name"]`` is aligned with
+    ``doc[1][i]`` which carries ``funding``, ``markPx``, ``oraclePx``, ``openInterest``,
+    ``premium`` (all strings). We keep only the coins we subscribe to. A malformed
+    document yields ``{}`` (never raises). ``funding`` is Hyperliquid's current hourly
+    rate as a fraction that the taker pays (long pays when positive).
+    """
+    if not isinstance(doc, list) or len(doc) != 2:
+        return {}
+    meta, ctxs = doc
+    universe = meta.get("universe") if isinstance(meta, dict) else None
+    if not isinstance(universe, list) or not isinstance(ctxs, list):
+        return {}
+    wanted = set(coins)
+    out: dict[str, dict] = {}
+    for row, ctx in zip(universe, ctxs):
+        if not isinstance(row, dict) or not isinstance(ctx, dict):
+            continue
+        name = row.get("name")
+        if name not in wanted:
+            continue
+        fields = {
+            "funding": _as_float(ctx.get("funding")),
+            "mark_px": _as_float(ctx.get("markPx")),
+            "oracle_px": _as_float(ctx.get("oraclePx")),
+            "open_interest": _as_float(ctx.get("openInterest")),
+            "premium": _as_float(ctx.get("premium")),
+        }
+        out[name] = {k: v for k, v in fields.items() if v is not None}
+    return out
+
+
+def fetch_funding(coins: list[str], *, url: str = INFO_URL, timeout: float = 20.0) -> dict[str, dict]:
+    """One read-only POST to the public info endpoint (no keys, no signing).
+
+    Refuses to run inside a test so the suite stays offline; the collector injects a
+    fake in unit tests. Any transport error propagates to the caller (logged, non-fatal).
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise CollectorError("refusing a real REST call inside a test (offline)")
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, data=FUNDING_PAYLOAD, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed https URL
+        doc = json.loads(resp.read().decode("utf-8"))
+    return parse_funding(doc, coins)
 
 
 def rss_bytes(status_path: str = "/proc/self/status") -> int:
@@ -281,15 +348,33 @@ class HourShards:
         self.hour = ""
         self.handles: dict[tuple[str, str], object] = {}
         self.raw_handles: dict[tuple[str, str], object] = {}
+        self._handle_paths: dict[tuple[str, str], Path] = {}
         self.lines: Counter = Counter()
         self.bytes_out = 0
         self.files: set[str] = set()
         self.errors = 0
+        self.checkpoints = 0
+        self.last_flush = self.now()
         self._roll(self.now())
 
     def _paths(self, date: str, hh: str, coin: str) -> tuple[Path, Path]:
         day_dir = self.data_dir / date
         return day_dir / f"{hh}_{coin}.jsonl.gz", self.raw_dir / date / f"{hh}_{coin}.jsonl"
+
+    def header_record(self, coin: str) -> dict:
+        """Format/schema header written as the first line of EVERY new shard file."""
+        return {
+            "e": "header",
+            "c": coin,
+            "schema": SCHEMA_ID,
+            "recv_field": "r",
+            "recv_units": "epoch_ms",
+            "feeds": ["l2", "bbo", "tr", "funding", "gap"],
+            "produced_by": "scripts/collector.py",
+        }
+
+    def _header_line(self, coin: str) -> str:
+        return json.dumps(self.header_record(coin), separators=(",", ":"), sort_keys=False) + "\n"
 
     def _roll(self, ts: float) -> None:
         date, hh = hour_key(ts)
@@ -301,22 +386,66 @@ class HourShards:
         (self.data_dir / date).mkdir(parents=True, exist_ok=True)
 
     def _close_all(self) -> None:
-        for fh in list(self.handles.values()) + list(self.raw_handles.values()):
+        self.flush()
+
+    @staticmethod
+    def _fsync_path(path: Path) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def flush(self) -> None:
+        """Finalize every open shard and fsync it, then drop the handles.
+
+        `gzip.open(..., "at")` keeps the whole compressed member (including the
+        end-of-stream marker) in a userspace buffer until `close()`, so a crash or a VM
+        reboot mid-hour would otherwise leave a 0-byte or truncated shard. Closing each
+        member every few seconds makes the on-disk shards valid gzip at all times; the
+        handles reopen lazily on the next write as an appended gzip member (which
+        `gzip`/`gzip.open` read transparently, with the text header written only once).
+        """
+        for key, fh in list(self.handles.items()):
+            path = self._handle_paths.get(key)
+            try:
+                fh.close()
+            except OSError:
+                pass
+            if path is not None:
+                self._fsync_path(path)
+        for fh in list(self.raw_handles.values()):
             try:
                 fh.close()
             except OSError:
                 pass
         self.handles.clear()
         self.raw_handles.clear()
+        self._handle_paths.clear()
+        self.checkpoints += 1
+
+    def maybe_flush(self, now: float) -> None:
+        if (now - self.last_flush) >= FLUSH_EVERY_S:
+            self.last_flush = now
+            self.flush()
 
     def _gz(self, date: str, hh: str, coin: str):
         key = (date, hh, coin)
         fh = self.handles.get(key)
         if fh is None:
             path, _ = self._paths(date, hh, coin)
+            fresh = not path.exists()
             fh = gzip.open(path, "at", encoding="utf-8", compresslevel=self.compresslevel)
             self.handles[key] = fh
+            self._handle_paths[key] = path
             self.files.add(str(path))
+            if fresh:
+                fh.write(self._header_line(coin))
         return fh
 
     def _raw(self, date: str, hh: str, coin: str):
@@ -325,9 +454,12 @@ class HourShards:
         if fh is None:
             _, path = self._paths(date, hh, coin)
             path.parent.mkdir(parents=True, exist_ok=True)
+            fresh = not path.exists()
             fh = path.open("at", encoding="utf-8")
             self.raw_handles[key] = fh
             self.files.add(str(path))
+            if fresh:
+                fh.write(self._header_line(coin))
         return fh
 
     def write(self, coin: str, record: dict) -> None:
@@ -354,6 +486,7 @@ class HourShards:
                 path = self.data_dir / self.date / f"{self.hour}_gaps.jsonl.gz"
                 fh = gzip.open(path, "at", encoding="utf-8", compresslevel=self.compresslevel)
                 self.handles[key] = fh
+                self._handle_paths[key] = path
                 self.files.add(str(path))
             fh.write(line)
             self.lines["_gaps"] += 1
@@ -415,9 +548,17 @@ class Collector:
         data_dir: Path = DATA_DIR,
         archive_enabled: bool = True,
         recv_timeout: float = RECV_TIMEOUT_S,
+        recv_ms=None,
+        funding_fetch=None,
+        funding_every_s: float = FUNDING_EVERY_S,
     ):
         self.coins = list(coins)
         self.connect = connect or (lambda: WsConnection(recv_timeout=recv_timeout))
+        self.recv_ms = recv_ms or (lambda: int(time.time() * 1000))
+        self.funding_fetch = funding_fetch or (lambda coins_: fetch_funding(coins_))
+        self.funding_every_s = funding_every_s
+        self.funding_samples = 0
+        self.funding_errors = 0
         self.log = log or RotatingLog(DEFAULT_LOG)
         self.data_dir = Path(data_dir)
         self.shards = shards or HourShards(self.data_dir, self.data_dir / "raw_sample", coins)
@@ -445,6 +586,7 @@ class Collector:
         self._last_stat = 0.0
         self._last_archive = 0.0
         self._last_ping = 0.0
+        self._last_funding = 0.0
         self._connected_at: float | None = None
 
     def request_stop(self, reason: str) -> None:
@@ -472,6 +614,7 @@ class Collector:
         if not force and (now - self._last_housekeep) < HOUSEKEEP_EVERY_S:
             return
         self._last_housekeep = now
+        self.shards.maybe_flush(now)
 
         free = int(self.disk_usage(self.data_dir if self.data_dir.exists() else PROJECT_ROOT).free)
         if free < STOP_FREE_BYTES:
@@ -522,9 +665,45 @@ class Collector:
             except OSError as exc:
                 self.log.write("ERROR", f"could not spawn archive: {exc}")
 
+        self._maybe_poll_funding(now)
+
         if (now - self._last_stat) >= STAT_EVERY_S:
             self._last_stat = now
             self._stat(free=free)
+
+    def _maybe_poll_funding(self, now: float) -> None:
+        """Periodic read-only funding poll (REST `metaAndAssetCtxs`) -> shard `e=funding`.
+
+        Method (documented): one public unsigned POST per `funding_every_s` (default 60 s),
+        NOT a second WebSocket. Each returned coin becomes one `{"t":<local ms>,"c":coin,
+        "e":"funding","r":<recv ms>,"funding":rate,"mark_px":..,"oracle_px":..,
+        "open_interest":..,"premium":..}` line in that coin's shard, so the offline replay
+        can charge `-position_sz * mark_px * funding_rate` once per UTC hour.
+        """
+        if (now - self._last_funding) < self.funding_every_s:
+            return
+        self._last_funding = now
+        try:
+            data = self.funding_fetch(self.coins)
+        except Exception as exc:
+            self.funding_errors += 1
+            self.log.write("WARN", f"funding poll failed: {type(exc).__name__}: {exc}")
+            return
+        if not data:
+            return
+        ts = int(now * 1000)
+        recv = self.recv_ms()
+        for coin in self.coins:
+            fields = data.get(coin)
+            if not fields:
+                continue
+            rec = {"t": ts, "c": coin, "e": "funding", "r": recv}
+            rec.update(fields)
+            try:
+                self.shards.write(coin, rec)
+                self.funding_samples += 1
+            except OSError as exc:
+                self.log.write("ERROR", f"funding write failed: {exc}")
 
     def _read_archive_log(self) -> str:
         try:
@@ -540,7 +719,8 @@ class Collector:
             f"l2={self.counts['l2']} bbo={self.counts['bbo']} tr={self.counts['tr']} "
             f"malformed={self.counts['malformed']} reconnects={self.reconnects} "
             f"rss_mb={used / 1048576:.1f} free_mb={free / 1048576:.0f} "
-            f"msgs_in={self.messages} subs={self.subscribed}",
+            f"msgs_in={self.messages} subs={self.subscribed} "
+            f"funding={self.funding_samples}",
         )
 
     def _subscribe(self, ws) -> None:
@@ -562,7 +742,9 @@ class Collector:
 
     def _handle(self, message: str) -> None:
         self.messages += 1
+        recv = self.recv_ms()
         for coin, record in dispatch(message, self.counts):
+            record["r"] = recv
             try:
                 self.shards.write(coin, record)
             except OSError as exc:
@@ -580,6 +762,13 @@ class Collector:
             "reconnect": self.reconnects,
         }
         self.shards.write_gap(rec)
+        for coin in self.coins:
+            coin_rec = dict(rec)
+            coin_rec["c"] = coin
+            try:
+                self.shards.write(coin, coin_rec)
+            except OSError as exc:
+                self.log.write("ERROR", f"gap marker write failed for {coin}: {exc}")
         self.log.write("WARN", f"gap #{self.reconnects}: {reason}")
 
     def read_loop(self, ws, *, max_loops: int | None = None) -> None:

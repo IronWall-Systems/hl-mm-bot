@@ -97,9 +97,13 @@ def make_collector(
     rss: int = 40 * 1024 * 1024,
     clock: Clock | None = None,
     archive_enabled: bool = True,
+    recv_ms=None,
+    funding_fetch=None,
 ):
     clock = clock or Clock()
     coins = list(coins or APPROVED)
+    recv_ms = recv_ms or (lambda: int(clock.now() * 1000))
+    funding_fetch = funding_fetch or (lambda _coins: {})
     log = col.RotatingLog(tmp_path / "collector.log")
     shards = col.HourShards(tmp_path / "data", tmp_path / "data" / "raw_sample", coins, now=clock.now)
     sleeps: list[str] = []
@@ -131,6 +135,8 @@ def make_collector(
         else col.rss_bytes(status_path),
         data_dir=tmp_path / "data",
         archive_enabled=archive_enabled,
+        recv_ms=recv_ms,
+        funding_fetch=funding_fetch,
     )
     holder["c"] = c
     ctx = SimpleNamespace(
@@ -290,9 +296,66 @@ def test_hour_shards_gzip_and_raw_first_hour(tmp_path):
     assert SHARD_RE.match(gz.name)
     with gzip.open(gz, "rt") as fh:
         payload = [json.loads(line) for line in fh]
-    assert payload[0]["c"] == "BTC"
-    assert raw.read_text().strip() == json.dumps(payload[0], separators=(",", ":"))
+    assert payload[0]["e"] == "header" and payload[0]["c"] == "BTC"
+    assert payload[1]["e"] == "l2"
+    encoded = [json.dumps(rec, separators=(",", ":")) for rec in payload]
+    assert raw.read_text().splitlines() == encoded
     shards.close()
+
+
+def test_hour_shards_checkpoint_is_readable_without_close(tmp_path):
+    clock = Clock()
+    shards = col.HourShards(tmp_path / "data", tmp_path / "data" / "raw_sample", ["BTC"],
+                            now=clock.now)
+    date, hh = col.hour_key(clock.now())
+    gz = tmp_path / "data" / date / f"{hh}_BTC.jsonl.gz"
+    shards.write("BTC", {"t": 1, "c": "BTC", "e": "l2", "b": [], "a": []})
+    assert gz.stat().st_size == 0, "gzip holds everything in userspace until finalized"
+    shards.flush()
+    assert gz.stat().st_size > 0
+    assert subprocess.run(["gzip", "-t", str(gz)]).returncode == 0, "valid gzip mid-hour"
+    with gzip.open(gz, "rt", encoding="utf-8") as fh:
+        recs = [json.loads(x) for x in fh if x.strip()]
+    assert [r["e"] for r in recs] == ["header", "l2"]
+
+    shards.write("BTC", {"t": 2, "c": "BTC", "e": "tr", "side": "B", "px": "1", "sz": "1"})
+    shards.flush()
+    with gzip.open(gz, "rt", encoding="utf-8") as fh:
+        recs = [json.loads(x) for x in fh if x.strip()]
+    assert [r["e"] for r in recs] == ["header", "l2", "tr"], "appended member keeps header once"
+    shards.close()
+
+
+def test_hour_shards_maybe_flush_respects_interval(tmp_path):
+    clock = Clock()
+    shards = col.HourShards(tmp_path / "data", tmp_path / "data" / "raw_sample", ["BTC"],
+                            now=clock.now)
+    date, hh = col.hour_key(clock.now())
+    gz = tmp_path / "data" / date / f"{hh}_BTC.jsonl.gz"
+    shards.write("BTC", {"t": 1, "c": "BTC", "e": "l2", "b": [], "a": []})
+    clock.advance(1.0)
+    shards.maybe_flush(clock.now())
+    assert gz.stat().st_size == 0, "no checkpoint before the interval elapses"
+    clock.advance(col.FLUSH_EVERY_S)
+    shards.maybe_flush(clock.now())
+    assert gz.stat().st_size > 0
+    shards.close()
+
+
+def test_housekeeping_flushes_shards_durably(tmp_path):
+    clock = Clock()
+    frame = json.dumps({"channel": "l2Book", "data": {"coin": "BTC", "time": 1,
+                                                      "levels": [[], []]}})
+    ctx = make_collector(tmp_path, coins=["BTC"], frames=[frame], clock=clock)
+    ctx.collector._handle(frame)
+    date, hh = col.hour_key(clock.now())
+    gz = tmp_path / "data" / date / f"{hh}_BTC.jsonl.gz"
+    assert gz.stat().st_size == 0
+    clock.advance(col.FLUSH_EVERY_S + 1.0)
+    ctx.collector.housekeeping(force=True)
+    assert gz.stat().st_size > 0, "housekeeping checkpoints shards so a crash loses <= the interval"
+    with gzip.open(gz, "rt", encoding="utf-8") as fh:
+        assert any(json.loads(x).get("e") == "l2" for x in fh if x.strip())
 
 
 def test_hour_shards_rollover_closes_hour_and_writes_gap(tmp_path):
@@ -311,7 +374,9 @@ def test_hour_shards_rollover_closes_hour_and_writes_gap(tmp_path):
     assert (tmp_path / "data" / date2 / f"{hh2}_BTC.jsonl.gz").is_file()
     with gzip.open(tmp_path / "data" / date2 / f"{hh2}_BTC.jsonl.gz", "rt") as fh:
         second_hour = [json.loads(line) for line in fh]
-    assert [r["t"] for r in second_hour] == [3]
+    assert second_hour[0]["e"] == "header", "each new shard opens with a format header"
+    events = [r for r in second_hour if r.get("e") != "header"]
+    assert [r["t"] for r in events] == [3]
     raw2 = tmp_path / "data" / "raw_sample" / date2 / f"{hh2}_BTC.jsonl"
     assert not raw2.exists(), "raw copy only for the first hour"
     with gzip.open(tmp_path / "data" / date1 / f"{hh1}_gaps.jsonl.gz", "rt") as fh:
@@ -365,11 +430,128 @@ def test_subscriptions_payload_shapes(tmp_path):
     assert payloads[0]["subscription"]["coin"] == "BTC"
     assert payloads[-1]["subscription"]["coin"] == "BNB"
 
-    recs = read_shards(ctx)
+    recs = [r for r in read_shards(ctx) if r.get("e") != "header"]
     assert {r["e"] for r in recs} == {"l2", "bbo", "tr"}
     assert next(r for r in recs if r["e"] == "tr")["c"] == "XMR"
     assert ctx.collector.counts["malformed"] == 0
     ctx.collector.shutdown()
+
+
+# ------------------------------------------------------- v2: recv stamp / header / gap / funding
+def test_every_recorded_event_carries_recv_stamp(tmp_path):
+    l2_frame = json.dumps({"channel": "l2Book", "data": {
+        "coin": "BTC", "time": 1,
+        "levels": [[{"px": "1", "sz": "1", "n": 1}], [{"px": "2", "sz": "1", "n": 1}]]}})
+    bbo_frame = json.dumps({"channel": "bbo", "data": {
+        "coin": "HYPE", "time": 2,
+        "bbo": [{"px": "1", "sz": "1", "n": 1}, {"px": "2", "sz": "1", "n": 1}]}})
+    tr_frame = json.dumps({"channel": "trades", "data": [
+        {"coin": "XMR", "side": "B", "px": "1", "sz": "1", "time": 3, "tid": 9}]})
+    ctx = make_collector(tmp_path, frames=[l2_frame, bbo_frame, tr_frame])
+    ctx.collector.run(max_loops=6)
+    events = [r for r in read_shards(ctx) if r.get("e") in ("l2", "bbo", "tr")]
+    assert events, "frames must be recorded"
+    expected = int(ctx.clock.now() * 1000)
+    assert all(isinstance(r.get("r"), int) for r in events)
+    assert all(r["r"] == expected for r in events)
+    ctx.collector.shutdown()
+
+
+def test_new_shard_starts_with_format_header(tmp_path):
+    clock = Clock()
+    shards = col.HourShards(tmp_path / "data", tmp_path / "data" / "raw_sample", ["BTC"], now=clock.now)
+    shards.write("BTC", {"t": 1, "c": "BTC", "e": "l2", "b": [], "a": []})
+    date, hh = col.hour_key(clock.now())
+    shards.close()
+    with gzip.open(tmp_path / "data" / date / f"{hh}_BTC.jsonl.gz", "rt") as fh:
+        lines = [json.loads(x) for x in fh if x.strip()]
+    assert lines[0]["e"] == "header"
+    assert lines[0]["c"] == "BTC"
+    assert lines[0]["schema"] == col.SCHEMA_ID
+    assert lines[0]["recv_field"] == "r"
+    assert lines[1]["e"] == "l2"
+    clock.advance(3600)
+    shards.write("BTC", {"t": 2, "c": "BTC", "e": "l2", "b": [], "a": []})
+    date2, hh2 = col.hour_key(clock.now())
+    shards.close()
+    with gzip.open(tmp_path / "data" / date2 / f"{hh2}_BTC.jsonl.gz", "rt") as fh:
+        lines2 = [json.loads(x) for x in fh if x.strip()]
+    assert lines2[0]["e"] == "header" and lines2[0]["c"] == "BTC"
+    assert lines2[1]["e"] == "l2"
+
+
+def test_reconnect_writes_gap_marker_per_coin(tmp_path):
+    boom = FakeWS([ConnectionError("server went away")])
+    healthy = FakeWS([json.dumps({"channel": "bbo", "data": {
+        "coin": "BTC", "time": 9, "bbo": [{"px": "1", "sz": "1", "n": 1},
+                                          {"px": "2", "sz": "1", "n": 1}]}})])
+    ctx = make_collector(tmp_path, coins=["BTC", "ETH"], sockets=[boom, healthy])
+    ctx.collector.run(max_loops=5)
+    per_coin: dict[str, list] = {}
+    for path in sorted((ctx.tmp / "data").glob("*/*.jsonl.gz")):
+        if path.name.endswith("_gaps.jsonl.gz"):
+            continue
+        with gzip.open(path, "rt") as fh:
+            for line in fh:
+                rec = json.loads(line)
+                if rec.get("e") == "gap":
+                    per_coin.setdefault(rec.get("c"), []).append(rec)
+    assert set(per_coin) == {"BTC", "ETH"}, "a reconnect must mark EVERY subscribed coin"
+    assert all(rows and rows[0]["reconnect"] >= 1 for rows in per_coin.values())
+    assert read_gaps(ctx), "the global gap file is still written"
+    ctx.collector.shutdown()
+
+
+def test_funding_poll_writes_funding_records(tmp_path):
+    clock = Clock()
+    calls: list[list[str]] = []
+
+    def fake_fetch(coins):
+        calls.append(list(coins))
+        return {"BTC": {"funding": 0.0000125, "mark_px": 86000.0, "open_interest": 123.0}}
+
+    ctx = make_collector(tmp_path, coins=["BTC"], clock=clock, funding_fetch=fake_fetch)
+    ctx.collector.housekeeping(force=True)
+    assert calls, "funding fetch must run on the first housekeeping tick"
+    ctx.shards.close()
+    recs = [r for r in read_shards(ctx) if r.get("e") == "funding"]
+    assert len(recs) == 1
+    assert recs[0]["c"] == "BTC" and recs[0]["funding"] == 0.0000125
+    assert recs[0]["mark_px"] == 86000.0 and isinstance(recs[0]["r"], int)
+    ctx.collector.housekeeping(force=True)
+    assert len(calls) == 1, "must not poll again inside the interval"
+    clock.advance(61)
+    ctx.collector.housekeeping(force=True)
+    assert len(calls) == 2
+    assert ctx.collector.funding_samples == 2
+    ctx.collector.shutdown()
+
+
+def test_funding_poll_failure_is_logged_not_fatal(tmp_path):
+    def boom(_coins):
+        raise RuntimeError("rest down")
+
+    ctx = make_collector(tmp_path, free=4 << 30, funding_fetch=boom)
+    ctx.collector.housekeeping(force=True)
+    assert ctx.collector.stop_reason is None
+    assert "funding poll failed" in (tmp_path / "collector.log").read_text()
+    ctx.collector.shutdown()
+
+
+def test_parse_funding_maps_universe_to_ctx():
+    doc = [
+        {"universe": [{"name": "BTC"}, {"name": "ETH"}, {"name": "XRP"}]},
+        [
+            {"funding": "0.0000125", "markPx": "86000.0", "openInterest": "10", "premium": "-0.0001"},
+            {"funding": "-0.0002", "markPx": "2700.5", "openInterest": "20", "premium": "0.0003"},
+            {"funding": "0.0", "markPx": "1.51", "openInterest": "30", "premium": "0.0"},
+        ],
+    ]
+    out = col.parse_funding(doc, ["ETH", "XRP"])
+    assert set(out) == {"ETH", "XRP"}
+    assert out["ETH"]["funding"] == -0.0002 and out["ETH"]["mark_px"] == 2700.5
+    assert out["XRP"]["open_interest"] == 30.0
+    assert col.parse_funding({"bad": 1}, ["BTC"]) == {}
 
 
 def test_survives_malformed_frames_and_stops_cleanly(tmp_path):

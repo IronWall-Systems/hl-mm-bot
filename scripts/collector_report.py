@@ -188,6 +188,14 @@ def main() -> int:
     arch = last_line(log, "archive run finished")
     out.append("archive  : " + (arch.split("] ", 1)[-1][:180] if arch != "-" else "no run yet"))
 
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import paper_report
+
+        out.append(paper_report.summary_line(paper_report.load_state(paper_report.STATE_FILE)))
+    except Exception as exc:  # never let the paper summary break the collector report
+        out.append(f"paper    : unavailable ({type(exc).__name__})")
+
     log_path = LOG_FILE
     if log_path.exists():
         size = log_path.stat().st_size

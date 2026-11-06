@@ -124,6 +124,13 @@ class RiskConfig:
     max_order_notional: float = 25.0
     max_position_notional: float = 80.0   # worst case incl. resting orders
     hard_position_mult: float = 1.5       # |pos| beyond mult*max_position -> kill
+    # Hard account-equity kill-switch: halt if start_equity - equity >= this.
+    # 0 disables the check (backwards compatible); set RISK_MAX_ACCOUNT_LOSS_USD.
+    max_account_loss_usd: float = 0.0
+    # Emergency position cap: |pos| * mid at or above this triggers the kill path,
+    # which cancels all orders, taker-flattens, verifies flat, and halts.
+    # 0 disables the check.
+    emergency_flatten_notional: float = 40.0
     max_drawdown_pct: float = 0.05        # vs high-water mark
     max_loss_pct: float = 0.10            # vs starting equity
     max_latency_ms: float = 1500.0

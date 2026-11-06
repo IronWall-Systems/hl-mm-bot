@@ -62,6 +62,10 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         raise SystemExit("quote_notional exceeds RiskConfig.max_order_notional")
     if strat.max_notional > risk.max_position_notional:
         raise SystemExit("strategy max_notional exceeds RiskConfig.max_position_notional")
+    if risk.max_account_loss_usd < 0:
+        raise SystemExit("RISK_MAX_ACCOUNT_LOSS_USD must be >= 0 (0 disables)")
+    if risk.emergency_flatten_notional < 0:
+        raise SystemExit("RISK_EMERGENCY_FLATTEN_NOTIONAL must be >= 0 (0 disables)")
 
     return Settings(env=env, account_address=environ["HL_ACCOUNT_ADDRESS"], api_secret=environ["HL_API_SECRET"],
                     coin=coin, dry_run=environ.get("HL_DRY_RUN", "1") != "0",

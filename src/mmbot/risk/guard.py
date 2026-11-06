@@ -13,6 +13,8 @@ from ..models import PositionState, Quote, RiskConfig, Side
 class KillReason(str, Enum):
     DRAWDOWN = "drawdown_from_peak"
     MAX_LOSS = "loss_from_start"
+    MAX_ACCOUNT_LOSS = "max_account_loss_usd"
+    EMERGENCY_FLATTEN = "emergency_flatten_notional"
     LATENCY = "latency_spike"
     POSITION = "position_beyond_hard_cap"
     MARGIN = "margin_utilization"
@@ -97,14 +99,24 @@ class RiskGuard:
         c = self.cfg
         if self.equity <= 0:
             return KillReason.EQUITY_UNREADABLE
+        # Hard account-equity loss (explicit USD budget). Checked before the
+        # percentage stop so a deliberate small-account budget wins.
+        if c.max_account_loss_usd > 0 and (
+            self.start_equity - self.equity >= c.max_account_loss_usd
+        ):
+            return KillReason.MAX_ACCOUNT_LOSS
         if (self.peak_equity - self.equity) / self.peak_equity >= c.max_drawdown_pct:
             return KillReason.DRAWDOWN
         if (self.start_equity - self.equity) / self.start_equity >= c.max_loss_pct:
             return KillReason.MAX_LOSS
         if self.lat_breaches >= c.latency_breach_count:
             return KillReason.LATENCY
+        # The absolute hard position kill is the outer bound; the emergency
+        # flatten cap is the earlier, softer trigger inside it.
         if abs(pos.size * mid) > c.hard_position_mult * c.max_position_notional:
             return KillReason.POSITION
+        if c.emergency_flatten_notional > 0 and abs(pos.size * mid) >= c.emergency_flatten_notional:
+            return KillReason.EMERGENCY_FLATTEN
         if pos.margin_utilization >= c.kill_margin_utilization:
             return KillReason.MARGIN
         if self.consecutive_errors >= c.max_consecutive_errors:

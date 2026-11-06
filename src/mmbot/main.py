@@ -213,6 +213,21 @@ class Bot:
                 self._force_reconcile = True
                 log.warning("cancel failed %s: %s", o.cloid, r.error)
 
+    async def _purge_side_exposure(self, side: Side, now: float) -> None:
+        """Cancel every active order on a side that just failed the risk veto.
+
+        A PENDING_NEW order can still land after the veto, and a RESTING order can
+        still fill; either would recreate the exposure the veto rejected. Cancel
+        both and count the purge for observability.
+        """
+        orders = self.om.active(side)
+        if not orders:
+            return
+        self.metrics["veto_purges"] += 1
+        log.warning("risk veto purge: cancelling %d %s order(s) after exposure veto",
+                    len(orders), side.value)
+        await self._do_cancels(orders, now)
+
     async def _do_places(self, quotes, now: float, feed_age: float) -> None:
         mid = self.market.mid
         for q in quotes:
@@ -220,6 +235,11 @@ class Bot:
             if not v.ok:
                 self.metrics["risk_rejects"] += 1
                 log.info("risk veto %s %.2f: %s", q.side.value, q.price, v.reason)
+                # Veto-path purge: the risk check said this side may not increase
+                # exposure. Do not leave a resting/pending order on that side
+                # behind (a fill there would recreate the exposure the veto just
+                # rejected). This is the live analogue of purging a queued place.
+                await self._purge_side_exposure(q.side, now)
                 continue
             o = self.om.register_pending(q, now)
             res = await self.gw.place_alo(q.side, q.price, q.size, o.cloid)
@@ -377,11 +397,11 @@ class Bot:
         rss_peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # Linux: KiB -> MiB
         return ("metrics book=%d fills=%d places=%d cancels=%d cross_rejects=%d risk_rejects=%d "
                 "other_rejects=%d place_errors=%d stale_pulls=%d feed_restarts=%d pos_drift=%d "
-                "orphans_cancelled=%d stale_pruned=%d actions_min=%d lat_ema_ms=%.0f "
+                "orphans_cancelled=%d stale_pruned=%d veto_purges=%d actions_min=%d lat_ema_ms=%.0f "
                 "pos=%.6f equity=%.2f rss_peak_mb=%.0f feed_age=%.2f") % (
             m["book"], m["fills"], m["places"], m["cancels"], m["cross_rejects"], m["risk_rejects"],
             m["other_rejects"], m["place_errors"], m["stale_pulls"], m["feed_restarts"],
-            m["pos_drift"], m["orphans_cancelled"], m["stale_pruned"], actions, lat_ema,
+            m["pos_drift"], m["orphans_cancelled"], m["stale_pruned"], m["veto_purges"], actions, lat_ema,
             self.pos.size, equity, rss_peak_mb, self.gw.feed_age_s())
 
     def emit_metrics(self) -> None:

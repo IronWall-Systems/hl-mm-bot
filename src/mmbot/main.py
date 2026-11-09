@@ -38,6 +38,45 @@ from .strategy.quoter import compute_quotes, toxic_sides
 log = logging.getLogger("mmbot")
 
 
+class ToxicityDebouncer:
+    """Hysteresis around the per-tick toxicity signal.
+
+    The raw ``toxic_sides`` set flips on individual book events (575 transitions
+    in 15 min on 2026-11-09), which parked the book continuously.  Require the
+    same toxic side-set on ``confirm_n`` consecutive book events before firing,
+    and re-arm only after ``clear_n`` consecutive clean events.
+    """
+
+    def __init__(self, confirm_n: int = 3, clear_n: int = 10):
+        self.confirm_n = max(1, int(confirm_n))
+        self.clear_n = max(1, int(clear_n))
+        self._prev: frozenset = frozenset()
+        self.streak = 0
+        self._clear = 0
+        self.armed = True
+
+    def update(self, micro: MicroState, p: StrategyParams) -> frozenset:
+        """Return the toxic set when it should trigger, else an empty set."""
+        tox = toxic_sides(micro, p)
+        if tox and tox == self._prev:
+            self.streak += 1
+        elif tox:
+            self.streak = 1
+        else:
+            self.streak = 0
+        if tox:
+            self._clear = 0
+        else:
+            self._clear += 1
+            if self._clear >= self.clear_n:
+                self.armed = True
+        fired = tox if (tox and self.armed and self.streak >= self.confirm_n) else frozenset()
+        if fired:
+            self.armed = False
+        self._prev = tox
+        return fired
+
+
 class Bot:
     def __init__(self, gw: Gateway, params: StrategyParams, rcfg: RiskConfig,
                  now_fn: Callable[[], float] = time.monotonic, flatten_on_exit: bool = True):
@@ -76,9 +115,13 @@ class Bot:
         self._markouts: list = []
         # Lean 3-signal microstructure state + toxicity fast-path trigger.
         self.micro: Optional[MicroState] = None
-        self._toxic_prev: frozenset = frozenset()
         self._micro_urgent = False
         self._last_fast_cycle = -1e9
+        # Toxicity hysteresis: confirm a sustained toxic set before acting and
+        # re-arm only after a clean spell (see ToxicityDebouncer).
+        self._tox = ToxicityDebouncer(
+            int(os.environ.get("MM_TOX_CONFIRM_N", "3")),
+            int(os.environ.get("MM_TOX_CLEAR_N", "10")))
         # ---- budget-aware batch quoting (MM_BATCH_PLANNER=1) --------------------
         self.use_batch_planner = os.environ.get("MM_BATCH_PLANNER", "0").lower() not in (
             "0", "false", "no", "off", "")
@@ -170,16 +213,17 @@ class Bot:
                 pass
             if ev.micro is not None:
                 self.micro = ev.micro
-                tox = toxic_sides(self.micro, self.p)
-                if tox and tox != self._toxic_prev:
+                fired = self._tox.update(self.micro, self.p)
+                if fired:
                     self._micro_urgent = True          # bypass cadence: widen the exposed leg
-                    self._jlog("toxicity", sides=sorted(s.value for s in tox),
+                    self.metrics["tox_events"] += 1
+                    self._jlog("toxicity", sides=sorted(s.value for s in fired),
+                               streak=self._tox.streak,
                                obi_nw=round(self.micro.obi_nw, 4),
                                tfi2=round(self.micro.tfi2, 4),
                                lead_btc_1s=round(self.micro.lead_btc_1s, 4),
                                wall_bid=self.micro.wall_bid_px,
                                wall_ask=self.micro.wall_ask_px)
-                self._toxic_prev = tox
             self._stale_state = None                 # T7b: new book event ends the silence episode
             self._last_book_t = self.now()           # T7c observability
             self.metrics["book"] += 1
@@ -649,6 +693,11 @@ class Bot:
         50% of mid, SELL at 150%, size capped by ``max_order_notional``).  The
         caller then issues a cleanup ``bulk_cancel`` on the rotated oids.  If the
         modify is rejected, the caller falls back to a raw cancel.
+
+        A leg whose far-OTM price would push its notional below the exchange
+        minimum ($10) is not modified at all; the caller's bulk_cancel removes
+        it instead.  This avoids a guaranteed minimum-value rejection on a
+        low-priced asset.
         """
         if not orders or self.market is None:
             return [], list(orders)
@@ -665,7 +714,9 @@ class Bot:
                 continue
             max_sz = self.rcfg.max_order_notional / px
             sz = round_sz(min(o.remaining, max_sz), szd)
-            if sz <= 0:
+            if sz <= 0 or px * sz < self.p.min_order_notional:
+                # Cannot park this leg without breaking the exchange minimum
+                # order value: leave it untouched for the caller's raw cancel.
                 continue
             self.om.mark_modify_sent(o, now)
             reqs.append({"oid": o.oid, "side": o.side, "price": px, "size": sz,
@@ -1151,6 +1202,10 @@ async def _budget_dry_run(s, minutes: float, cost_mode: str) -> int:
     proj_budget.update_from_api({"nRequestsUsed": 0, "nRequestsCap": proj_cap,
                                  "cumVlm": budget.cumVlm})
     planner = BatchPlanner(proj_budget, bands, charge_mode=cost_mode, now=time.monotonic)
+    tox_deb = ToxicityDebouncer(int(os.environ.get("MM_TOX_CONFIRM_N", "3")),
+                                int(os.environ.get("MM_TOX_CLEAR_N", "10")))
+    urgent_pending = False
+    tox_fires = 0
     log.info("DRY-RUN BUDGET: projection uses a fresh-wallet budget used=0 cap=%d "
              "(real used=%d cap=%d headroom=%d mode=%s)",
              proj_cap, budget.nRequestsUsed, budget.nRequestsCap,
@@ -1219,11 +1274,15 @@ async def _budget_dry_run(s, minutes: float, cost_mode: str) -> int:
 
             if isinstance(ev, BookEvent) and ev.market.is_valid:
                 ref = ewma.update(ev.market.mid, now)
+                if ev.micro is not None and tox_deb.update(ev.micro, s.strategy):
+                    urgent_pending = True
+                    tox_fires += 1
                 if now - last_plan >= min_interval:
                     last_plan = now
                     sz = round_sz(s.strategy.quote_notional / ref, gw.spec.sz_decimals)
                     payloads = planner.plan(_aged(now), ref, {"buy": sz, "sell": sz},
-                                            urgent_risk=False, skip=frozenset())
+                                            urgent_risk=urgent_pending, skip=frozenset())
+                    urgent_pending = False
                     added = _apply(payloads, now)
                     if added:
                         calls += added
@@ -1263,7 +1322,7 @@ async def _budget_dry_run(s, minutes: float, cost_mode: str) -> int:
         f"(real used={budget.nRequestsUsed} cap={budget.nRequestsCap} "
         f"headroom={budget.headroom} mode={budget.mode}); "
         f"uptime={uptime:.1f}% h_eff(avg)={h_eff_avg:.2f}bps h_eff(final)={planner.h_eff():.2f}bps "
-        f"minutes[{dist}] actions={dict(actions)}")
+        f"tox_fires={tox_fires} minutes[{dist}] actions={dict(actions)}")
     log.info(summary)
     print(summary)
     return 0

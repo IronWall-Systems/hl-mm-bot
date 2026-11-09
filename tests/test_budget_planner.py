@@ -1,11 +1,16 @@
 """Contract tests for the budget-aware quote bands and batch planner."""
 from __future__ import annotations
 
+import asyncio
+
+from mmbot.exchange.types import BookEvent
 from mmbot.execution.batch_planner import (
     BatchPlanner, BatchParams, Leg, LiveQuote, Payload)
 from mmbot.execution.quote_bands import (
     Act, BandParams, EWMARef, QuotePlanner, RequestBudget, calibrate_costs,
     dist_bps, effective_half_spread, target_px)
+from mmbot.main import Bot
+from mmbot.models import MarketState, MicroState, RiskConfig, StrategyParams
 
 
 def test_package_imports_reconstruct_direct_execution():
@@ -178,3 +183,57 @@ def test_rate_per_h_uses_600s_span_floor():
     bp.on_sent(Payload("place", [Leg("sell", "place", 101.0, 0.1, True, "place")]))
     # 2 calls over the 600 s floor -> 12/h, not 3600/h
     assert abs(bp.rate_per_h() - 12.0) < 1e-6
+
+
+def test_budget_degraded_action_backs_off_before_replacing():
+    clock = [0.0]
+    b = _fresh_budget(clock)
+    for _ in range(15):                       # drain the burst bucket
+        b.record(1)
+    bp = BatchPlanner(b, BandParams(), charge_mode="call", now=lambda: clock[0])
+    ref = 100.0
+    live = {"buy": LiveQuote(7, target_px("buy", ref, 10.0), 0.15, 0.0), "sell": None}
+    p1 = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15})
+    assert any(p.kind == "cancel" for p in p1)          # degraded to protective pull
+    for p in p1:
+        bp.on_sent(p)
+    clock[0] = 5.0
+    p2 = bp.plan({"buy": None, "sell": None}, ref, {"buy": 0.15, "sell": 0.15})
+    assert not any(any(l.side == "buy" for l in p.legs) for p in p2)
+    clock[0] = 61.0                            # backoff elapsed + bucket refilled
+    p3 = bp.plan({"buy": None, "sell": None}, ref, {"buy": 0.15, "sell": 0.15})
+    assert any(any(l.side == "buy" and l.kind == "place" for l in p.legs) for p in p3)
+
+
+class _NullGw:
+    pass
+
+
+def test_toxicity_debounce_and_hysteresis():
+    bot = Bot(_NullGw(), StrategyParams(coin="HYPE"), RiskConfig())
+
+    def book(obi: float) -> BookEvent:
+        return BookEvent(MarketState("HYPE", 100.0, 100.1, 1.0, 1.0, 0.0),
+                         MicroState(obi_nw=obi))
+
+    # two toxic snapshots are not enough (confirm_n = 3)
+    for _ in range(2):
+        asyncio.run(bot.handle_event(book(-0.9)))
+    assert bot._micro_urgent is False
+    asyncio.run(bot.handle_event(book(-0.9)))
+    assert bot._micro_urgent is True
+    assert bot.metrics["tox_events"] == 1
+
+    bot._micro_urgent = False                  # cycle consumes the trigger
+    # chatter must not re-trigger while unarmed
+    for obi in (-0.9, 0.0, -0.9, 0.0):
+        asyncio.run(bot.handle_event(book(obi)))
+    assert bot._micro_urgent is False
+
+    # clear_n = 10 clean snapshots re-arm, then 3 sustained toxic snapshots fire
+    for _ in range(10):
+        asyncio.run(bot.handle_event(book(0.0)))
+    for _ in range(3):
+        asyncio.run(bot.handle_event(book(-0.9)))
+    assert bot._micro_urgent is True
+    assert bot.metrics["tox_events"] == 2

@@ -92,7 +92,7 @@ def test_modify_rotates_oid_and_retires_the_old_mapping():
 def test_places_use_one_bulk_action():
     async def go():
         bot, gw, _ = await make()
-        quotes = [Quote(Side.BUY, 69990.0, 0.00028), Quote(Side.SELL, 70011.0, 0.00028)]
+        quotes = [Quote(Side.BUY, 69990.0, 0.00030), Quote(Side.SELL, 70011.0, 0.00030)]
         await bot._do_places(quotes, 0.0, 0.0)
         assert gw.bulk_place_calls == 1 and len(gw.place_calls) == 2
         assert len(gw.orders) == 2
@@ -102,7 +102,7 @@ def test_places_use_one_bulk_action():
 def test_oid_cancels_use_one_bulk_action():
     async def go():
         bot, gw, _ = await make()
-        quotes = [Quote(Side.BUY, 69990.0, 0.00028), Quote(Side.SELL, 70011.0, 0.00028)]
+        quotes = [Quote(Side.BUY, 69990.0, 0.00030), Quote(Side.SELL, 70011.0, 0.00030)]
         await bot._do_places(quotes, 0.0, 0.0)
         await bot._do_cancels(bot.om.active(), 1.0)
         # Risk-off pulls park via one batchModify first, then clean up with one
@@ -127,7 +127,7 @@ def test_cloid_only_cancels_use_the_cloid_bulk_path():
 def test_requote_uses_one_batch_modify_and_rotates_oids():
     async def go():
         bot, gw, _ = await make()
-        quotes = [Quote(Side.BUY, 69990.0, 0.00028), Quote(Side.SELL, 70011.0, 0.00028)]
+        quotes = [Quote(Side.BUY, 69990.0, 0.00030), Quote(Side.SELL, 70011.0, 0.00030)]
         await bot._do_places(quotes, 0.0, 0.0)
         old = {o.side: o.oid for o in bot.om.active()}
         assert len(old) == 2
@@ -152,7 +152,7 @@ def test_requote_uses_one_batch_modify_and_rotates_oids():
 def test_risk_off_pull_parks_via_batch_modify_then_cancels():
     async def go():
         bot, gw, _ = await make()
-        quotes = [Quote(Side.BUY, 69990.0, 0.00028), Quote(Side.SELL, 70011.0, 0.00028)]
+        quotes = [Quote(Side.BUY, 69990.0, 0.00030), Quote(Side.SELL, 70011.0, 0.00030)]
         await bot._do_places(quotes, 0.0, 0.0)
         old = {o.side: o.oid for o in bot.om.active()}
 
@@ -172,7 +172,7 @@ def test_risk_off_pull_parks_via_batch_modify_then_cancels():
 def test_park_rejection_falls_back_to_raw_cancel():
     async def go():
         bot, gw, _ = await make()
-        await bot._do_places([Quote(Side.BUY, 69990.0, 0.00028)], 0.0, 0.0)
+        await bot._do_places([Quote(Side.BUY, 69990.0, 0.00030)], 0.0, 0.0)
         gw.forced_modify = [PlaceKind.REJECT_OTHER]
         o = bot.om.active(Side.BUY)[0]
         oid = o.oid

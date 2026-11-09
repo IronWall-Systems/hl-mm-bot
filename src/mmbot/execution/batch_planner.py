@@ -46,6 +46,7 @@ class BatchParams:
     pull_mode: str = "park"      # park | cancel
     min_gap_near_s: float = 5.0
     min_gap_far_s: float = 35.0
+    degraded_backoff_s: float = 60.0   # quiet period after a budget-refused action
 
 
 class BatchPlanner:
@@ -55,6 +56,7 @@ class BatchPlanner:
         self.b, self.bands, self.q, self.mode, self.now = budget, bands, params, charge_mode, now
         self._last_sent: Dict[str, float] = {}
         self._blocked_until: Dict[str, float] = {}
+        self._degraded_until: Dict[str, float] = {}
         self._acts: Deque[Tuple[float, int]] = deque()
 
     def _cost(self, n_legs: int) -> int:
@@ -95,6 +97,8 @@ class BatchPlanner:
 
         for side in ("buy", "sell"):
             if side in skip or t < self._blocked_until.get(side, 0.0):
+                continue
+            if t < self._degraded_until.get(side, 0.0):
                 continue
             lq, sz, tgt = live.get(side), tgt_sz.get(side), target_px(side, ref, H)
             if lq is not None and not sz:                  # side disabled (inventory cap): pull it
@@ -147,8 +151,18 @@ class BatchPlanner:
                 out.append(Payload(kind, legs))
             elif kind == "modify":
                 danger = [l for l in legs if l.why in ("near", "pull-park")]
+                # Budget-degraded: protect the book with a cancel, then back
+                # off this side so the next cycle cannot immediately re-place
+                # into the same exhausted bucket (cancel -> place churn).
                 if danger and self.b.may_send("cancel", self._cost(len(danger))):
                     out.append(Payload("cancel", [Leg(l.side, "cancel", None, None, True, "pull") for l in danger]))
+                for l in danger:
+                    self._degraded_until[l.side] = t + q.degraded_backoff_s
+            else:
+                # Quote/place refused by the token bucket: wait for the bucket
+                # to refill instead of retrying (and cancelling) every cycle.
+                for l in legs:
+                    self._degraded_until[l.side] = t + q.degraded_backoff_s
         return out
 
 

@@ -103,8 +103,11 @@ class BatchPlanner:
 
         Resting quotes are FREE.  While the budget is merely THROTTLED/DEGRADED we
         never cancel them: we only decline *new* places and non-urgent modifies.
-        Cancels happen only for inventory-cap disables, confirmed side toxicity,
-        or an imminent adverse fill (``d < imminent_bps``).
+        Cancels happen only for inventory-cap disables, an imminent adverse fill
+        (``d < imminent_bps``), or confirmed side toxicity *while the quote is
+        already inside the near edge* (``d < H - a``).  Toxicity on a quote that
+        still rests outside the near edge just freezes repricing - it does not
+        throw away free resting liquidity.
         """
         t, p, q = self.now(), self.bands, self.q
         H = self.h_eff()
@@ -134,10 +137,16 @@ class BatchPlanner:
             a = min(p.near_frac * H, p.near_max_bps)
             far = max(p.far_frac * H, p.far_min_bps)
             new_sz = sz or lq.sz
-            if side in toxic_set or d < q.imminent_bps:
-                # Genuine danger (directional toxicity or imminent adverse fill):
-                # cancel, do not park 4*H away for 2 legs and zero fills.
+            if d < q.imminent_bps or (side in toxic_set and d < H - a):
+                # Genuine danger: an imminent adverse fill, or directional
+                # toxicity while the quote is already inside the near edge
+                # (< H - a).  A quote resting at/outside the target spread is
+                # left alone: post-only at our price is free and may fill.
                 nec[side] = Leg(side, "cancel", None, None, True, "pull")
+            elif side in toxic_set:
+                # Adverse flow but the quote is still outside the near edge:
+                # keep liquidity, just do not reprice it into the flow.
+                continue
             elif d < H - a:
                 # Too close: snap straight back to the target spread (1 leg).
                 if (t - self._near_sent.get(side, -1e9) >= q.near_cooldown_s

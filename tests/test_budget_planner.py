@@ -121,11 +121,24 @@ def test_toxicity_cancels_only_vulnerable_side():
     b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 10000, "cumVlm": 0.0})
     bp = BatchPlanner(b, BandParams(), charge_mode="leg", now=lambda: 0.0)
     ref = 100.0
-    live = {"buy": LiveQuote(1, target_px("buy", ref, 20.0), 0.15, 0.0),
+    # Buy has drifted inside the near edge (8 bps < 15 bps) and is toxic;
+    # the sell sits at target and must be left untouched.
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 8.0), 0.15, 0.0),
             "sell": LiveQuote(2, target_px("sell", ref, 20.0), 0.15, 0.0)}
     payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15}, toxic=frozenset({"buy"}))
     assert len(payloads) == 1 and payloads[0].kind == "cancel"
     assert [l.side for l in payloads[0].legs] == ["buy"]
+
+
+def test_toxicity_does_not_cancel_quote_at_target_spread():
+    b = RequestBudget(reserve=500, horizon_h=24.0, now=lambda: 0.0)
+    b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 10000, "cumVlm": 0.0})
+    bp = BatchPlanner(b, BandParams(), charge_mode="leg", now=lambda: 0.0)
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 20.0), 0.15, 0.0),
+            "sell": LiveQuote(2, target_px("sell", ref, 20.0), 0.15, 0.0)}
+    payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15}, toxic=frozenset({"buy"}))
+    assert payloads == []
 
 
 def test_idempotent_modify_skips_sub_3bps_target_move():

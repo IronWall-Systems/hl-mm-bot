@@ -42,11 +42,13 @@ class BatchParams:
     piggy_min_bps: float = 2.0
     max_defer_s: float = 300.0
     very_far_mult: float = 1.5
-    park_mult: float = 4.0
-    pull_mode: str = "park"      # park | cancel
+    pull_mode: str = "cancel"    # cancel | park (park is not used live: 2 legs for 0 fills)
     min_gap_near_s: float = 5.0
     min_gap_far_s: float = 35.0
     degraded_backoff_s: float = 60.0   # quiet period after a budget-refused action
+    near_cooldown_s: float = 10.0      # per-side cooldown between near re-quotes
+    idempotent_bps: float = 3.0        # never modify if the target moved less than this
+    imminent_bps: float = 4.5          # cancel (not park) only this close / adverse
 
 
 class BatchPlanner:
@@ -57,6 +59,7 @@ class BatchPlanner:
         self._last_sent: Dict[str, float] = {}
         self._blocked_until: Dict[str, float] = {}
         self._degraded_until: Dict[str, float] = {}
+        self._near_sent: Dict[str, float] = {}
         self._acts: Deque[Tuple[float, int]] = deque()
 
     def _cost(self, n_legs: int) -> int:
@@ -81,15 +84,33 @@ class BatchPlanner:
         self._acts.append((t, cost))
         self.b.record(cost)
         for leg in payload.legs:
+            if leg.why == "near":
+                self._near_sent[leg.side] = t
             if leg.why.startswith("pull"):
                 self._blocked_until[leg.side] = t + self.bands.pull_resume_s
 
+    def _moved(self, new_px: float, old_px: float, ref: float, min_bps: float) -> bool:
+        """Idempotency gate: only act when the target actually moved."""
+        return abs(new_px - old_px) / ref * 1e4 >= min_bps
+
     def plan(self, live: Dict[str, Optional[LiveQuote]], ref: float, tgt_sz: Dict[str, float],
-             urgent_risk: bool = False, skip: frozenset = frozenset()) -> List[Payload]:
+             urgent_risk: bool = False, skip: frozenset = frozenset(),
+             toxic: frozenset = frozenset()) -> List[Payload]:
         """tgt_sz: sizes for the sides that may quote (a side missing/0 here is disabled, e.g. inventory cap).
-        skip: sides with a request still in flight (do nothing there until it resolves)."""
+        skip: sides with a request still in flight (do nothing there until it resolves).
+        toxic: sides with confirmed adverse flow; only those sides take defensive action.
+        urgent_risk: legacy bilateral flag (kept for the dry-run); prefer ``toxic``.
+
+        Resting quotes are FREE.  While the budget is merely THROTTLED/DEGRADED we
+        never cancel them: we only decline *new* places and non-urgent modifies.
+        Cancels happen only for inventory-cap disables, confirmed side toxicity,
+        or an imminent adverse fill (``d < imminent_bps``).
+        """
         t, p, q = self.now(), self.bands, self.q
         H = self.h_eff()
+        toxic_set = {str(s).lower() for s in toxic}
+        if urgent_risk and not toxic_set:
+            toxic_set = {"buy", "sell"}
         nec: Dict[str, Leg] = {}
         opt: Dict[str, Leg] = {}
         piggy: Dict[str, Leg] = {}
@@ -105,28 +126,34 @@ class BatchPlanner:
                 nec[side] = Leg(side, "cancel", None, None, True, "pull")
                 continue
             if lq is None:
-                if sz:
+                # Never place into confirmed adverse flow on that side.
+                if sz and side not in toxic_set:
                     places.append(Leg(side, "place", tgt, sz, True, "place"))
                 continue
             d = dist_bps(side, lq.px, ref)
             a = min(p.near_frac * H, p.near_max_bps)
             far = max(p.far_frac * H, p.far_min_bps)
             new_sz = sz or lq.sz
-            if urgent_risk or d < H * p.pull_frac:
-                if q.pull_mode == "park":
-                    nec[side] = Leg(side, "modify", target_px(side, ref, H * q.park_mult), lq.sz, True, "pull-park")
-                else:
-                    nec[side] = Leg(side, "cancel", None, None, True, "pull")
+            if side in toxic_set or d < q.imminent_bps:
+                # Genuine danger (directional toxicity or imminent adverse fill):
+                # cancel, do not park 4*H away for 2 legs and zero fills.
+                nec[side] = Leg(side, "cancel", None, None, True, "pull")
             elif d < H - a:
-                nec[side] = Leg(side, "modify", tgt, new_sz, True, "near")
+                # Too close: snap straight back to the target spread (1 leg).
+                if (t - self._near_sent.get(side, -1e9) >= q.near_cooldown_s
+                        and self._moved(tgt, lq.px, ref, q.idempotent_bps)):
+                    nec[side] = Leg(side, "modify", tgt, new_sz, True, "near")
             elif d > H + far:
                 very = d > H + q.very_far_mult * far or lq.age_s >= q.max_defer_s
-                (nec if very else opt)[side] = Leg(side, "modify", tgt, new_sz, very, "far-very" if very else "far")
+                if self._moved(tgt, lq.px, ref, q.idempotent_bps):
+                    (nec if very else opt)[side] = Leg(side, "modify", tgt, new_sz, very,
+                                                      "far-very" if very else "far")
             else:
                 near_slack = d - (H - a)
                 far_slack = (H + far) - d
                 about_to_fire = near_slack <= q.piggy_near_frac * a or far_slack <= q.piggy_far_frac * far
-                if about_to_fire and abs(tgt - lq.px) / ref * 1e4 >= q.piggy_min_bps:
+                if (about_to_fire
+                        and self._moved(tgt, lq.px, ref, max(q.piggy_min_bps, q.idempotent_bps))):
                     piggy[side] = Leg(side, "modify", tgt, new_sz, False, "piggy")
 
         mod_legs = [l for l in nec.values() if l.kind == "modify"]
@@ -149,18 +176,10 @@ class BatchPlanner:
             ok = self.b.may_send("cancel", cost) if kind == "cancel" else self.b.may_send("quote", cost)
             if ok:
                 out.append(Payload(kind, legs))
-            elif kind == "modify":
-                danger = [l for l in legs if l.why in ("near", "pull-park")]
-                # Budget-degraded: protect the book with a cancel, then back
-                # off this side so the next cycle cannot immediately re-place
-                # into the same exhausted bucket (cancel -> place churn).
-                if danger and self.b.may_send("cancel", self._cost(len(danger))):
-                    out.append(Payload("cancel", [Leg(l.side, "cancel", None, None, True, "pull") for l in danger]))
-                for l in danger:
-                    self._degraded_until[l.side] = t + q.degraded_backoff_s
             else:
-                # Quote/place refused by the token bucket: wait for the bucket
-                # to refill instead of retrying (and cancelling) every cycle.
+                # THROTTLED/DEGRADED: never cancel a resting quote just because
+                # the bucket is dry - it is free to leave in the book and may
+                # still fill.  Only suppress the new action and retry later.
                 for l in legs:
                     self._degraded_until[l.side] = t + q.degraded_backoff_s
         return out

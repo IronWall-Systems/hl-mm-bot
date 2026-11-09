@@ -9,8 +9,10 @@ from mmbot.execution.batch_planner import (
 from mmbot.execution.quote_bands import (
     Act, BandParams, EWMARef, QuotePlanner, RequestBudget, calibrate_costs,
     dist_bps, effective_half_spread, target_px)
-from mmbot.main import Bot
-from mmbot.models import MarketState, MicroState, RiskConfig, StrategyParams
+from mmbot.main import Bot, ToxicityDebouncer
+from mmbot.precision import round_sz
+from mmbot.models import (MarketState, MicroState, PositionState, RiskConfig, Side,
+                          StrategyParams)
 
 
 def test_package_imports_reconstruct_direct_execution():
@@ -84,16 +86,58 @@ def test_budget_record_is_monotonic_against_lagging_api():
     assert b.nRequestsUsed == 13
 
 
-def test_degraded_planner_turns_near_quote_into_cancel():
+def test_close_quote_reprices_instead_of_parking():
     b = RequestBudget(reserve=500, horizon_h=24.0, now=lambda: 0.0)
-    # below reserve -> quotes refused, cancels allowed
-    b.update_from_api({"nRequestsUsed": 19600, "nRequestsCap": 20000, "cumVlm": 1.0})
-    bp = BatchPlanner(b, BandParams(), charge_mode="call", now=lambda: 0.0)
+    b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 20000, "cumVlm": 1.0})
+    bp = BatchPlanner(b, BandParams(), charge_mode="leg", now=lambda: 0.0)
     ref = 100.0
+    # 8 bps is closer than the 15 bps near edge but not imminent (>= 4.5 bps).
     live = {"buy": LiveQuote(7, target_px("buy", ref, 8.0), 0.15, 0.0), "sell": None}
+    payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.0})
+    assert [p.kind for p in payloads] == ["modify"]
+    leg = payloads[0].legs[0]
+    assert leg.why == "near" and abs(dist_bps("buy", leg.px, ref) - bp.h_eff()) < 1e-6
+
+
+def test_no_cancel_while_budget_throttled():
+    clock = [0.0]
+    b = RequestBudget(reserve=500, horizon_h=24.0, now=lambda: clock[0])
+    b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 10000, "cumVlm": 0.0})
+    for _ in range(15):                       # drain burst -> THROTTLED
+        b.record(1)
+    assert b.mode == "THROTTLED"
+    bp = BatchPlanner(b, BandParams(), charge_mode="call", now=lambda: clock[0])
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 8.0), 0.15, 0.0),
+            "sell": LiveQuote(2, target_px("sell", ref, 8.0), 0.15, 0.0)}
     payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15})
-    assert [p.kind for p in payloads] == ["cancel"]
-    assert all(l.why == "pull" for l in payloads[0].legs)
+    # Throttled: neither resting quote may be cancelled or parked.
+    assert not any(p.kind == "cancel" for p in payloads)
+    assert not any(l.why == "pull-park" for p in payloads for l in p.legs)
+
+
+def test_toxicity_cancels_only_vulnerable_side():
+    b = RequestBudget(reserve=500, horizon_h=24.0, now=lambda: 0.0)
+    b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 10000, "cumVlm": 0.0})
+    bp = BatchPlanner(b, BandParams(), charge_mode="leg", now=lambda: 0.0)
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 20.0), 0.15, 0.0),
+            "sell": LiveQuote(2, target_px("sell", ref, 20.0), 0.15, 0.0)}
+    payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15}, toxic=frozenset({"buy"}))
+    assert len(payloads) == 1 and payloads[0].kind == "cancel"
+    assert [l.side for l in payloads[0].legs] == ["buy"]
+
+
+def test_idempotent_modify_skips_sub_3bps_target_move():
+    b = RequestBudget(reserve=500, horizon_h=24.0, now=lambda: 0.0)
+    b.update_from_api({"nRequestsUsed": 0, "nRequestsCap": 10000, "cumVlm": 0.0})
+    bands = BandParams(half_spread_bps=10.0)
+    bp = BatchPlanner(b, bands, charge_mode="leg", now=lambda: 0.0)
+    ref = 100.0
+    # 8 bps vs a 10 bps target: inside the band, piggy trigger is 2 bps < 3 bps.
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 8.0), 0.15, 0.0), "sell": None}
+    payloads = bp.plan(live, ref, {"buy": 0.15, "sell": 0.0})
+    assert payloads == []
 
 
 def test_near_and_far_snap():
@@ -194,7 +238,7 @@ def test_budget_degraded_action_backs_off_before_replacing():
     ref = 100.0
     live = {"buy": LiveQuote(7, target_px("buy", ref, 10.0), 0.15, 0.0), "sell": None}
     p1 = bp.plan(live, ref, {"buy": 0.15, "sell": 0.15})
-    assert any(p.kind == "cancel" for p in p1)          # degraded to protective pull
+    assert p1 == []                                     # never cancel a resting quote
     for p in p1:
         bp.on_sent(p)
     clock[0] = 5.0
@@ -237,3 +281,62 @@ def test_toxicity_debounce_and_hysteresis():
         asyncio.run(bot.handle_event(book(-0.9)))
     assert bot._micro_urgent is True
     assert bot.metrics["tox_events"] == 2
+
+
+def test_inventory_skew_tightens_reducing_side():
+    bot = Bot(_NullGw(), StrategyParams(coin="HYPE", skew_bps=6.5, max_notional=24.0),
+              RiskConfig())
+    mid = 100.0
+    # Flat: no skew.
+    assert abs(bot._quote_ref(mid) - mid) < 1e-12
+    # Long 24 notional (~full): reference shifts down 6.5 bps -> ask tightens,
+    # bid widens.
+    bot.pos = PositionState(size=24.0 / mid)
+    ref_long = bot._quote_ref(mid)
+    assert abs((mid - ref_long) / mid * 1e4 - 6.5) < 0.05
+    # Short mirrors it: reference shifts up, tightening the bid.
+    bot.pos = PositionState(size=-24.0 / mid)
+    ref_short = bot._quote_ref(mid)
+    assert abs((ref_short - mid) / mid * 1e4 - 6.5) < 0.05
+
+
+def test_debouncer_current_is_directional_and_latched():
+    p = StrategyParams(coin="HYPE")
+    deb = ToxicityDebouncer(confirm_n=3, clear_n=10)
+    buy_tox = MicroState(obi_nw=-0.9)          # selling pressure -> BUY vulnerable
+    for _ in range(3):
+        deb.update(buy_tox, p)
+    assert deb.current() == frozenset({Side.BUY})
+    # Still toxic (no both-sides flip) while the same side-set persists.
+    deb.update(buy_tox, p)
+    assert deb.current() == frozenset({Side.BUY})
+    # A clean tick clears the latched defensive set.
+    deb.update(MicroState(obi_nw=0.0), p)
+    assert deb.current() == frozenset()
+
+
+class _SpecStub:
+    sz_decimals = 2
+
+
+class _GwStub:
+    spec = _SpecStub()
+
+
+def test_inventory_cap_binds_at_two_fills_not_three():
+    bot = Bot(_GwStub(), StrategyParams(coin="HYPE", quote_notional=12.0, max_notional=24.0),
+              RiskConfig())
+    ref = 74.6
+    base = round_sz(12.0 / ref, 2)             # 0.16
+    assert base > 0
+    assert bot._tgt_sizes(ref)["buy"] == base
+    bot.pos = PositionState(size=base)         # 1 fill: may still add
+    assert bot._tgt_sizes(ref)["buy"] == base
+    bot.pos = PositionState(size=2 * base)     # 2 fills (~$24): stop adding
+    tgt = bot._tgt_sizes(ref)
+    assert tgt["buy"] == 0.0
+    assert tgt["sell"] == base                 # only the reducing side quotes
+    # Short mirror.
+    bot.pos = PositionState(size=-2 * base)
+    tgt = bot._tgt_sizes(ref)
+    assert tgt["sell"] == 0.0 and tgt["buy"] == base

@@ -438,10 +438,11 @@ class QuotePlanner:
             self._pulled_at[s] = now
             return Act.PULL, None
 
-        # Budget gate: refuse repricing but still allow the pull/cancel.
+        # Budget gate: refuse repricing but NEVER cancel a resting quote just
+        # because the token bucket is dry.  Resting liquidity is free and may
+        # still fill; only new places / repricings are suppressed.
         if not self.budget.may_send("quote"):
-            self._pulled_at[s] = now
-            return Act.PULL, None
+            return Act.NONE, None
 
         near = self.near_edge_bps
         far = self.far_edge_bps

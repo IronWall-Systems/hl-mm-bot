@@ -127,18 +127,20 @@ class OrderManager:
         return out
 
     def plan_batched(self, batch_planner, ref: float, tgt_sz: Dict[str, float], now: float,
-                     urgent_risk: bool = False, skip: Optional[FrozenSet[Side]] = None):
+                     urgent_risk: bool = False, skip: Optional[FrozenSet[Side]] = None,
+                     toxic: frozenset = frozenset()):
         """Delegate to ``BatchPlanner`` with in-flight sides passed as ``skip``.
 
         ``tgt_sz`` is ``{"buy": size, "sell": size}``; a 0/missing side is
         disabled (e.g. inventory cap) and the planner emits a protective pull.
+        ``toxic`` carries the confirmed *directional* toxicity side-set.
         """
         skip_set = self.in_flight_sides() if skip is None else frozenset(skip)
         live = self.live_quotes(now)
         for side in skip_set:
             live[side.value] = None
         return batch_planner.plan(live, ref, tgt_sz, urgent_risk=urgent_risk,
-                                  skip=frozenset(s.value for s in skip_set))
+                                  skip=frozenset(s.value for s in skip_set), toxic=toxic)
 
     # ---- state transitions ----------------------------------------------------
     def register_pending(self, q: Quote, now: float) -> Order:

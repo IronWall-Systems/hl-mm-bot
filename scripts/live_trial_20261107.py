@@ -33,20 +33,20 @@ os.environ["HL_JSONL_LOG"] = str(ROOT / "logs" / "live_trial_20261107_hype.jsonl
 
 # ---- budget-aware batch quoting (validated by the 2026-11-09 dry-run) -------
 os.environ.setdefault("MM_BATCH_PLANNER", "1")
-os.environ.setdefault("MM_BATCH_COST_MODE", "call")
+os.environ.setdefault("MM_BATCH_COST_MODE", "leg")
 
 # ---- lean 3-signal microstructure upgrade (2026-11-07, see PREREG2_MICROSTRUCTURE_UPGRADE) ----
 # Volatility-calibrated width (2026-11-09): HYPE realised sigma is 8.2-12 bps
-# per sqrt(min), so a 4-5.5 bps half-spread sat inside 1-second noise and was
-# picked off before the near-move cooldown.  Base 14 bps sits outside that
-# noise while still capturing genuine swings; near_max caps the tight edge at
-# H - 5 bps, far_min keeps the deferral edge at 20 bps.
-os.environ["MM_HALF_SPREAD_BPS"] = "14.0"
-os.environ["MM_BAND_HALF_SPREAD_BPS"] = "14.0"
+# per sqrt(min).  Base 15 bps sits outside that noise; near_max caps the tight
+# edge at H - 5 bps (10 bps), far_min keeps the deferral edge at 20 bps.
+# skew_bps=6.5 tightens the reducing side by ~6.5 bps at full inventory so a
+# fill exits at ~+8.5 bps over mid while the adding side widens to ~21.5 bps.
+os.environ["MM_HALF_SPREAD_BPS"] = "15.0"
+os.environ["MM_BAND_HALF_SPREAD_BPS"] = "15.0"
 os.environ["MM_BAND_NEAR_MAX_BPS"] = "5.0"
 os.environ["MM_BAND_FAR_MIN_BPS"] = "20.0"
 os.environ["MM_BAND_PULL_FRAC"] = "0.45"
-os.environ["MM_SKEW_BPS"] = "3.0"
+os.environ["MM_SKEW_BPS"] = "6.5"
 os.environ["MM_REQUOTE_THRESHOLD_BPS"] = "2.0"
 os.environ["MM_MIN_REQUOTE_INTERVAL_S"] = "1.0"
 os.environ["MM_SIZE_TOLERANCE"] = "0.5"
@@ -66,12 +66,12 @@ os.environ["MM_WALL_MAX_BPS"] = "22.0"
 os.environ["MM_QUOTE_NOTIONAL"] = "12.0"
 os.environ["MM_MIN_ORDER_NOTIONAL"] = "10.0"
 os.environ["MM_MAX_NOTIONAL"] = "24.0"
-os.environ["RISK_MAX_ORDER_NOTIONAL"] = "12.0"
+os.environ["RISK_MAX_ORDER_NOTIONAL"] = "15.0"
 os.environ["RISK_MAX_POSITION_NOTIONAL"] = "30.0"
 os.environ["RISK_EMERGENCY_FLATTEN_NOTIONAL"] = "30.0"
-# ~10% hard stop on $21.12 equity: floor near $19.00.  The $2.10 absolute loss,
-# 10% drawdown-from-peak and 10% loss-from-start rules all bind at ~$19.0.
-os.environ["RISK_MAX_ACCOUNT_LOSS_USD"] = "2.10"
+# Hard stop on $21.12 equity: $2.00 absolute loss -> floor $19.12.  The
+# percentage rules are looser backstops; the USD rule binds first (overnight).
+os.environ["RISK_MAX_ACCOUNT_LOSS_USD"] = "2.00"
 os.environ["RISK_MAX_DRAWDOWN_PCT"] = "0.10"
 os.environ["RISK_MAX_LOSS_PCT"] = "0.10"
 # Stale-feed watchdog / disruption belts.

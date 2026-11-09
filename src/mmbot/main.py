@@ -76,6 +76,16 @@ class ToxicityDebouncer:
         self._prev = tox
         return fired
 
+    def current(self) -> frozenset:
+        """Confirmed, *directional* toxic side-set for defensive planning.
+
+        Unlike :meth:`update` (which fires once per armed episode for the fast
+        path), this stays latched for as long as the same side-set keeps
+        appearing on consecutive book events.  It never returns both sides
+        because of a single adverse tick.
+        """
+        return self._prev if self.streak >= self.confirm_n else frozenset()
+
 
 class Bot:
     def __init__(self, gw: Gateway, params: StrategyParams, rcfg: RiskConfig,
@@ -375,8 +385,27 @@ class Bot:
         szd = self.gw.spec.sz_decimals
         base = round_sz(self.p.quote_notional / ref, szd)
         max_sz = self.p.max_notional / ref
-        return {"buy": base if self.pos.size < max_sz else 0.0,
-                "sell": base if self.pos.size > -max_sz else 0.0}
+        # Disable a side once one more base-size fill would breach the cap.
+        # Using ``pos < max_sz`` alone lets a 3rd fill through when max_sz is
+        # just above 2 x base (e.g. 0.32 vs 0.3217): the cap must bind at 2
+        # fills, not 3.
+        tol = 1.0001
+        return {"buy": base if (self.pos.size + base) <= max_sz * tol else 0.0,
+                "sell": base if (self.pos.size - base) >= -max_sz * tol else 0.0}
+
+    def _quote_ref(self, ref: float) -> float:
+        """Reservation price with inventory skew applied (batch path).
+
+        Long inventory shifts the reference *down*, which tightens the ask
+        (fast profitable exit) and widens the bid (no careless doubling down);
+        short inventory mirrors it.  Skew is the same ``skew_bps`` used by the
+        legacy quoter, so the batch planner prices identically.
+        """
+        if ref is None or ref <= 0 or self.p.skew_bps == 0 or self.p.max_notional <= 0:
+            return ref
+        pos_n = self.pos.size * ref
+        clip = max(-1.0, min(1.0, pos_n / self.p.max_notional))
+        return ref * (1.0 - self.p.skew_bps * clip / 1e4)
 
     def _skip_sides(self, now: float) -> frozenset:
         """In-flight acks plus local cross-reject backoff."""
@@ -393,14 +422,19 @@ class Bot:
         ref = self.ewma_ref.value if self.ewma_ref.ready else self.market.mid
         if ref is None or ref <= 0:
             return
-        urgent = bool(toxic_sides(self.micro, self.p)) if self.micro is not None else False
-        payloads = self.om.plan_batched(self.batch_planner, ref, self._tgt_sizes(ref), now,
-                                        urgent_risk=urgent, skip=self._skip_sides(now))
+        # Use the *debounced, directional* toxic set (not the raw per-tick
+        # signal, which fired bilateral pull-park 1 s after placement).
+        tox = self._tox.current()
+        tox_sides = frozenset(s.value for s in tox)
+        payloads = self.om.plan_batched(self.batch_planner, self._quote_ref(ref),
+                                        self._tgt_sizes(ref), now,
+                                        skip=self._skip_sides(now), toxic=tox_sides)
         await self._execute_batch_payloads(payloads, now, feed_age)
         if abs(self.pos.size - inv0) > 1e-12:      # a fill landed during the RESTs
             ref = self.ewma_ref.value if self.ewma_ref.ready else self.market.mid
-            payloads = self.om.plan_batched(self.batch_planner, ref, self._tgt_sizes(ref), now,
-                                            urgent_risk=urgent, skip=self._skip_sides(now))
+            payloads = self.om.plan_batched(self.batch_planner, self._quote_ref(ref),
+                                            self._tgt_sizes(ref), now,
+                                            skip=self._skip_sides(now), toxic=tox_sides)
             await self._execute_batch_payloads(payloads, now, feed_age)
 
     async def _execute_batch_payloads(self, payloads, now: float, feed_age: float) -> None:

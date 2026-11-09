@@ -17,6 +17,7 @@ from typing import Dict, FrozenSet, Iterable, List, Optional
 
 from ..exchange.types import OrderUpdateEvent, PlaceKind, PlaceResult, RemoteOrder
 from ..models import Order, OrderStatus, Quote, Side, StrategyParams
+from .batch_planner import LiveQuote
 
 log = logging.getLogger("mmbot.orders")
 EPS = 1e-12
@@ -25,7 +26,15 @@ EPS = 1e-12
 @dataclass
 class Plan:
     cancels: List[Order] = field(default_factory=list)
+    modifies: List["Modify"] = field(default_factory=list)
     places: List[Quote] = field(default_factory=list)
+
+
+@dataclass
+class Modify:
+    """An in-place quote update: the live order plus the new target."""
+    order: Order
+    quote: Quote
 
 
 @dataclass
@@ -66,7 +75,8 @@ class OrderManager:
         plan = Plan()
         for side in (Side.BUY, Side.SELL):
             act = self.active(side)
-            if any(o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_CANCEL) for o in act):
+            if any(o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_MODIFY,
+                                OrderStatus.PENDING_CANCEL) for o in act):
                 continue                                    # wait for acks
             t = tmap.get(side)
             if t is None:
@@ -76,11 +86,59 @@ class OrderManager:
                 keep = min(act, key=lambda o: abs(o.price - t.price))
                 plan.cancels.extend(o for o in act if o is not keep)   # defensive: duplicates
                 if self._needs_requote(keep, t):
-                    plan.cancels.append(keep)
+                    plan.modifies.append(Modify(keep, t))              # in-place, one L1 action
                 continue
             if side not in blocked:
                 plan.places.append(t)
         return plan
+
+    # ---- budget-aware batch planning -----------------------------------------
+    def active_order(self, side: Side) -> Optional[Order]:
+        """The single live order on a side (the oldest, to keep oid identity)."""
+        act = self.active(side)
+        return min(act, key=lambda o: o.created_ts) if act else None
+
+    def in_flight_sides(self) -> FrozenSet[Side]:
+        """Sides with an unacked place/modify/cancel: the planner must skip them."""
+        return frozenset(
+            side for side in (Side.BUY, Side.SELL)
+            if any(o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_MODIFY,
+                                OrderStatus.PENDING_CANCEL)
+                   for o in self.active(side)))
+
+    def order_for_side(self, side) -> Optional[Order]:
+        """Resolve a planner leg's side back to the tracked resting order."""
+        try:
+            return self.active_order(Side(str(getattr(side, "value", side)).lower()))
+        except (ValueError, KeyError):
+            return None
+
+    def live_quotes(self, now: float) -> Dict[str, Optional[LiveQuote]]:
+        """``{side: LiveQuote | None}`` for the planner; pending sides are None."""
+        out: Dict[str, Optional[LiveQuote]] = {}
+        pending = self.in_flight_sides()
+        for side in (Side.BUY, Side.SELL):
+            o = None if side in pending else self.active_order(side)
+            if o is None or o.status is not OrderStatus.RESTING or o.oid is None:
+                out[side.value] = None
+            else:
+                out[side.value] = LiveQuote(oid=o.oid, px=o.price, sz=o.remaining,
+                                            age_s=max(0.0, now - o.updated_ts))
+        return out
+
+    def plan_batched(self, batch_planner, ref: float, tgt_sz: Dict[str, float], now: float,
+                     urgent_risk: bool = False, skip: Optional[FrozenSet[Side]] = None):
+        """Delegate to ``BatchPlanner`` with in-flight sides passed as ``skip``.
+
+        ``tgt_sz`` is ``{"buy": size, "sell": size}``; a 0/missing side is
+        disabled (e.g. inventory cap) and the planner emits a protective pull.
+        """
+        skip_set = self.in_flight_sides() if skip is None else frozenset(skip)
+        live = self.live_quotes(now)
+        for side in skip_set:
+            live[side.value] = None
+        return batch_planner.plan(live, ref, tgt_sz, urgent_risk=urgent_risk,
+                                  skip=frozenset(s.value for s in skip_set))
 
     # ---- state transitions ----------------------------------------------------
     def register_pending(self, q: Quote, now: float) -> Order:
@@ -90,9 +148,14 @@ class OrderManager:
         return o
 
     def mark_cancel_sent(self, o: Order, now: float) -> None:
-        if o.status in (OrderStatus.RESTING, OrderStatus.PENDING_NEW):
+        if o.status in (OrderStatus.RESTING, OrderStatus.PENDING_NEW, OrderStatus.PENDING_MODIFY):
             o.status = OrderStatus.PENDING_CANCEL
             o.cancel_sent_ts = now
+            o.updated_ts = now
+
+    def mark_modify_sent(self, o: Order, now: float) -> None:
+        if o.status is OrderStatus.RESTING:
+            o.status = OrderStatus.PENDING_MODIFY
             o.updated_ts = now
 
     def on_place_result(self, o: Order, res: PlaceResult, now: float) -> None:
@@ -111,24 +174,92 @@ class OrderManager:
             o.status = OrderStatus.REJECTED
         # PlaceKind.ERROR: leave PENDING_NEW; staleness pruning + reconcile decide its fate
 
+    def on_modify_result(self, o: Order, q: Quote, res: PlaceResult, now: float) -> None:
+        """Apply a ``batchModify`` ack.
+
+        Hyperliquid's ``batchModify`` CANCELS the old order and returns a NEW oid;
+        the old oid is immediately invalid and the cloid is not carried over.
+        """
+        o.updated_ts = now
+        if res.kind is PlaceKind.RESTING:
+            old = o.oid
+            if old is not None:
+                self._by_oid.pop(old, None)
+            o.oid = res.oid
+            if res.oid is not None:
+                self._by_oid[res.oid] = o
+            o.price = q.price
+            o.size = q.size
+            o.status = OrderStatus.RESTING
+        elif res.kind is PlaceKind.FILLED:
+            old = o.oid
+            if old is not None:
+                self._by_oid.pop(old, None)
+            o.status = OrderStatus.FILLED
+            o.oid = res.oid
+            if res.oid is not None:
+                self._by_oid[res.oid] = o
+            o.price = q.price
+            o.size = q.size
+            o.filled = o.size
+        elif res.kind in (PlaceKind.REJECT_CROSS, PlaceKind.REJECT_OTHER):
+            # A rejected modify normally leaves the old order resting. Keep it
+            # active and let the next cycle/reconcile decide; do not stack.
+            o.status = OrderStatus.RESTING
+            o.updated_ts = now
+        # PlaceKind.ERROR: leave PENDING_MODIFY; reconcile decides its fate.
+
     def on_cancel_result(self, o: Order, ok: bool, already_gone: bool, now: float) -> None:
         o.updated_ts = now
         if ok or already_gone:
             if o.status is OrderStatus.PENDING_CANCEL:
                 o.status = OrderStatus.CANCELED
+            # Retire the oid mapping on a confirmed cancel so a later exchange
+            # update for that oid cannot resurrect a dead order.
+            if o.oid is not None:
+                self._by_oid.pop(o.oid, None)
         else:
             if o.status is OrderStatus.PENDING_CANCEL:
                 o.status = OrderStatus.RESTING     # cancel failed; it may still be live
 
     def _find(self, cloid: Optional[str], oid: Optional[int]) -> Optional[Order]:
+        # oid is authoritative when present.  batchModify preserves the cloid
+        # but rotates the oid and emits a "canceled" update for the OLD oid, so
+        # matching by cloid first would resurrect that stale cancel against the
+        # live order.  Only fall back to the cloid for an order that has not yet
+        # received any oid.
+        if oid is not None:
+            o = self._by_oid.get(oid)
+            if o is not None:
+                return o
+            if cloid and cloid in self.orders and self.orders[cloid].oid is None:
+                return self.orders[cloid]
+            return None
         if cloid and cloid in self.orders:
             return self.orders[cloid]
-        if oid is not None:
-            return self._by_oid.get(oid)
         return None
 
+    def _adopt_oid(self, o: Order, oid: int) -> None:
+        """Bind a modified order to its new oid, retiring the old mapping."""
+        if o.oid is not None:
+            self._by_oid.pop(o.oid, None)
+        o.oid = oid
+        self._by_oid[oid] = o
+
     def on_order_update(self, ev: OrderUpdateEvent, now: float) -> Optional[Order]:
-        o = self._find(ev.cloid, ev.oid)
+        o = self._by_oid.get(ev.oid) if ev.oid is not None else None
+        if o is None and ev.cloid:
+            cand = self.orders.get(ev.cloid)
+            if cand is not None:
+                if cand.oid is None:
+                    o = cand
+                elif ev.oid is not None and ev.oid == cand.oid:
+                    o = cand
+                elif ev.status == "filled" and ev.oid is not None:
+                    # A fill on the new oid raced ahead of the modify ack.
+                    self._adopt_oid(cand, ev.oid)
+                    o = cand
+                # else: retired old-oid event from batchModify -> ignore
         if o is None:
             return None
         if ev.oid is not None and o.oid is None:
@@ -151,7 +282,16 @@ class OrderManager:
         return o
 
     def on_fill(self, cloid: Optional[str], oid: Optional[int], sz: float, now: float) -> Optional[Order]:
-        o = self._find(cloid, oid)
+        o = self._by_oid.get(oid) if oid is not None else None
+        if o is None and cloid:
+            cand = self.orders.get(cloid)
+            if cand is not None:
+                if cand.oid is None or cand.oid == oid:
+                    o = cand
+                elif oid is not None:
+                    # Fill on the new post-modify oid before the modify ack.
+                    self._adopt_oid(cand, oid)
+                    o = cand
         if o is None:
             return None
         o.filled += sz
@@ -163,7 +303,8 @@ class OrderManager:
     # ---- hygiene ----------------------------------------------------------------
     def stale(self, now: float) -> List[Order]:
         return [o for o in self.active()
-                if o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_CANCEL)
+                if o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_MODIFY,
+                                OrderStatus.PENDING_CANCEL)
                 and now - o.updated_ts > self.stale_after_s]
 
     def reconcile(self, remote: List[RemoteOrder], now: float) -> ReconcileReport:
@@ -173,7 +314,7 @@ class OrderManager:
         for o in self.active():
             alive = o.cloid in r_cloids or (o.oid is not None and o.oid in r_oids)
             if alive:
-                if o.status is OrderStatus.PENDING_NEW:
+                if o.status in (OrderStatus.PENDING_NEW, OrderStatus.PENDING_MODIFY):
                     o.status = OrderStatus.RESTING
                 continue
             # not on exchange. Give very fresh pending orders a grace window (ack in flight).

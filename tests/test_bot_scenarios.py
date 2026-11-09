@@ -43,8 +43,8 @@ def test_quotes_both_sides_then_hysteresis_then_requote():
         clk.t += 1; gw.set_book(69999.5, 70001.5); await pump(bot, gw); await bot.cycle()   # tiny move
         assert len(gw.place_calls) == n_places and not gw.cancel_calls
         clk.t += 1; gw.set_book(70019, 70021); await pump(bot, gw); await bot.cycle(); await pump(bot, gw)
-        assert len(gw.cancel_calls) == 2                                                    # cancel first
-        clk.t += 1; await bot.cycle(); await pump(bot, gw)                                  # then replace
+        assert len(gw.modify_calls) == 2 and not gw.cancel_calls                            # one batchModify, no cancel
+        clk.t += 1; await bot.cycle(); await pump(bot, gw)                                  # unchanged book: no churn
         px = {o["side"]: o["px"] for o in gw.orders.values()}
         assert len(px) == 2 and px[Side.BUY] > 69985 and px[Side.SELL] > 70040   # both repriced up with the book
     run(go())

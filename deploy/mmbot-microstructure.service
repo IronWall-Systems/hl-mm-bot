@@ -1,0 +1,33 @@
+[Unit]
+Description=HYPE microstructure signal daemon (read-only, publishes shared state)
+Documentation=file:///root/hl-mm-bot-live-safety-trial/src/mmbot/microstructure_daemon.py
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/hl-mm-bot-live-safety-trial
+Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/root/hl-mm-bot/venv/bin/python -m mmbot.microstructure_daemon --coin HYPE --publish-ms 100 --state-file /root/hl-mm-bot-live-safety-trial/logs/microstructure_state.json --log-file /root/hl-mm-bot-live-safety-trial/logs/microstructure_daemon.log
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+KillSignal=SIGTERM
+LimitNOFILE=65536
+MemoryMax=192M
+MemoryHigh=160M
+CPUQuota=25%
+TasksMax=64
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/hl-mm-bot-live-safety-trial/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -132,17 +132,44 @@ def rest(om, side, px, sz=0.0002, now=0.0, oid=1):
     return o
 
 
-def test_plan_hysteresis_and_cancel_then_place():
+def test_plan_hysteresis_and_modify_then_place():
     om = OrderManager(P)
     o = rest(om, Side.BUY, 70000)
     assert om.plan([Quote(Side.BUY, 70000, 0.0002)], 1.0).cancels == []             # unchanged
     assert om.plan([Quote(Side.BUY, 70005, 0.0002)], 1.0).cancels == []             # 0.7 bps < 1.5
     pl = om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.0)                             # 2.9 bps
-    assert pl.cancels == [o] and pl.places == []                                    # cancel first, place later
-    om.mark_cancel_sent(o, 1.0)
-    assert om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.1).places == []              # waits for ack
-    om.on_cancel_result(o, True, False, 1.2)
-    assert [q.price for q in om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.3).places] == [70020]
+    assert pl.cancels == [] and pl.places == [] and [m.order for m in pl.modifies] == [o]
+    om.mark_modify_sent(o, 1.0)
+    assert om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.1).modifies == []            # waits for ack
+    om.on_modify_result(o, Quote(Side.BUY, 70020, 0.0002),
+                        PlaceResult(PlaceKind.RESTING, oid=2), 1.2)
+    assert o.oid == 2 and o.price == 70020
+    assert om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.3).modifies == []            # now unchanged
+    # A missing target still pulls the resting order.
+    assert [x.cloid for x in om.plan([], 1.4).cancels] == [o.cloid]
+
+
+def test_batch_modify_old_oid_cancel_does_not_kill_new_oid():
+    """Live regression: batchModify preserves cloid but rotates the oid.
+
+    The exchange emits "open(new_oid)" and "canceled(old_oid)" with the same
+    cloid.  The stale old-oid cancel must not mark the live order CANCELED and
+    make the next plan place a duplicate pair.
+    """
+    om = OrderManager(P)
+    o = rest(om, Side.BUY, 70000, sz=0.0002, oid=1)
+    om.mark_modify_sent(o, 1.0)
+    om.on_modify_result(o, Quote(Side.BUY, 70020, 0.0002),
+                        PlaceResult(PlaceKind.RESTING, oid=2), 1.2)
+    assert o.oid == 2 and o.status is OrderStatus.RESTING
+    # Same cloid on both updates, old oid canceled and new oid open.
+    om.on_order_update(OrderUpdateEvent(1, o.cloid, "canceled"), 1.3)
+    assert o.status is OrderStatus.RESTING and o.oid == 2
+    om.on_order_update(OrderUpdateEvent(2, o.cloid, "open"), 1.3)
+    assert o.status is OrderStatus.RESTING and o.oid == 2
+    # No duplicate: the unchanged target is kept, not re-placed.
+    pl = om.plan([Quote(Side.BUY, 70020, 0.0002)], 1.4)
+    assert pl.places == [] and pl.modifies == [] and pl.cancels == []
 
 
 def test_plan_blocked_side_and_missing_target():

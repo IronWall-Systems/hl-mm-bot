@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-from ..models import MarketState, Side
+from ..models import MarketState, MicroState, Side
 
 
 class PlaceKind(str, Enum):
@@ -47,6 +47,7 @@ class RemoteOrder:
 @dataclass
 class BookEvent:
     market: MarketState
+    micro: Optional[MicroState] = None
 
 
 @dataclass

@@ -69,7 +69,10 @@ def test_gateway_subscribes_fast_l2book_by_default():
     g.info = _Recorder()
     g._subscribe()
     assert g.info.subs[0] == {"type": "l2Book", "coin": "BTC", "fast": True}
-    assert [s["type"] for s in g.info.subs] == ["l2Book", "orderUpdates", "userFills"]
+    core = [s["type"] for s in g.info.subs[:3]]
+    assert core == ["l2Book", "orderUpdates", "userFills"]
+    # Optional microstructure feeds follow the core subscriptions.
+    assert "trades" in [s["type"] for s in g.info.subs]
 
 
 def test_gateway_falls_back_to_default_l2book_when_fast_disabled():

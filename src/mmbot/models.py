@@ -19,15 +19,17 @@ class Side(str, Enum):
 
 
 class OrderStatus(str, Enum):
-    PENDING_NEW = "pending_new"        # sent, no ack yet
+    PENDING_NEW = "pending_new"         # sent, no ack yet
     RESTING = "resting"
-    PENDING_CANCEL = "pending_cancel"  # cancel sent, no ack yet
+    PENDING_MODIFY = "pending_modify"   # batchModify sent, no ack yet (old order may still rest)
+    PENDING_CANCEL = "pending_cancel"   # cancel sent, no ack yet
     FILLED = "filled"
     CANCELED = "canceled"
     REJECTED = "rejected"
 
 
-ACTIVE_STATUSES = frozenset({OrderStatus.PENDING_NEW, OrderStatus.RESTING, OrderStatus.PENDING_CANCEL})
+ACTIVE_STATUSES = frozenset({OrderStatus.PENDING_NEW, OrderStatus.RESTING,
+                             OrderStatus.PENDING_MODIFY, OrderStatus.PENDING_CANCEL})
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,27 @@ class PositionState:
 
     def notional(self, mid: float) -> float:
         return self.size * mid
+
+
+@dataclass(frozen=True)
+class MicroState:
+    """Zero-look-ahead microstructure snapshot used by the lean 3-signal quoter.
+
+    ``obi_nw`` is the top-5 L2 size imbalance weighted by ``sz * log1p(n)``;
+    ``tfi2`` is the 2 s aggressive taker-flow imbalance; ``lead_btc_1s`` is the
+    BTC 1 s mid return in bps.  ``wall_*`` are verified ``nSigFigs=4`` walls
+    (``n >= 5`` and ``sz >= 3x`` median) already filtered to 12-22 bps.
+    All values are computed from data received at or before the decision time.
+    """
+    obi_nw: float = 0.0
+    tfi2: float = 0.0
+    lead_btc_1s: float = 0.0
+    wall_bid_px: Optional[float] = None
+    wall_ask_px: Optional[float] = None
+    wall_bid_bps: Optional[float] = None
+    wall_ask_bps: Optional[float] = None
+    btc_ready: bool = False
+    ts: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -117,6 +140,17 @@ class StrategyParams:
     requote_threshold_bps: float = 1.5    # only reprice if target moved at least this much
     size_tolerance: float = 0.5           # requote if remaining < (1-tol) * target size
     min_requote_interval_s: float = 0.3
+    # ---- lean 3-signal microstructure pricing (PREREG2_MICROSTRUCTURE_UPGRADE) ----
+    micro_enabled: bool = True
+    w_obi_bps: float = 1.5                # reservation shift per unit obi_nw
+    w_tfi_bps: float = 1.0                # reservation shift per unit tfi2
+    w_btc_bps: float = 0.7                # reservation shift per bps of BTC 1s return
+    tox_obi: float = 0.45                 # |obi_nw| toxicity threshold
+    tox_tfi: float = 0.65                 # |tfi2| toxicity threshold
+    tox_btc_bps: float = 3.0              # adverse BTC 1s move threshold
+    tox_widen_mult: float = 2.5           # widen vulnerable leg by this multiple
+    wall_min_bps: float = 12.0            # only snap to walls in this band
+    wall_max_bps: float = 22.0
 
 
 @dataclass(frozen=True)

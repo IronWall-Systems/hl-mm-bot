@@ -1,0 +1,28 @@
+[Unit]
+Description=AI quant sentinel for the HYPE live trial
+Documentation=file:///root/hl-mm-bot-live-safety-trial/scripts/ai_sentinel.py
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/hl-mm-bot-live-safety-trial
+Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/hl-mm-bot/venv/bin/python scripts/ai_sentinel.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+KillSignal=SIGTERM
+LimitNOFILE=65536
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=128
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

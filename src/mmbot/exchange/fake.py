@@ -24,7 +24,12 @@ class FakeGateway:
         self.latency_ms = 5.0
         self.feed_age = 0.0
         self.forced: List[PlaceKind] = []            # forced results for upcoming place_alo calls
+        self.forced_modify: List[PlaceKind] = []     # forced results for upcoming modify_quotes calls
         self.place_calls: List[tuple] = []
+        self.modify_calls: List[dict] = []
+        self.bulk_place_calls = 0
+        self.modify_quotes_calls = 0
+        self.bulk_cancel_calls = 0
         self.cancel_calls: List[str] = []
         self.cancel_all_calls = 0
         self.flatten_calls = 0
@@ -76,6 +81,48 @@ class FakeGateway:
         self.events.put_nowait(OrderUpdateEvent(oid, cloid, "open", side, price, size))
         return PlaceResult(PlaceKind.RESTING, oid=oid, latency_ms=self.latency_ms)
 
+    async def bulk_place(self, orders):
+        """Loop ``place_alo`` so subclass overrides (e.g. a slow-gate test) still apply."""
+        self.bulk_place_calls += 1
+        return [await self.place_alo(o["side"], o["price"], o["size"], o["cloid"])
+                for o in orders]
+
+    async def modify_quotes(self, modifies):
+        self.modify_quotes_calls += 1              # one batchModify action
+        out = []
+        for m in modifies:
+            self.modify_calls.append(dict(m))
+            if self.forced_modify:
+                kind = self.forced_modify.pop(0)
+                if kind is PlaceKind.ERROR:
+                    out.append(PlaceResult(kind, error="simulated network error",
+                                           latency_ms=self.latency_ms))
+                    continue
+                out.append(PlaceResult(kind, error="simulated modify reject",
+                                       latency_ms=self.latency_ms))
+                continue
+            key = next((c for c, o in self.orders.items() if o["oid"] == m["oid"]), None)
+            if key is None:
+                out.append(PlaceResult(PlaceKind.REJECT_OTHER,
+                                       error="Order was never placed, already canceled, or filled.",
+                                       latency_ms=self.latency_ms))
+                continue
+            o = self.orders[key]
+            o["px"] = m["price"]
+            o["sz"] = m["size"]
+            o["oid"] = next(self._oid)               # batchModify rotates the oid
+            self.events.put_nowait(OrderUpdateEvent(o["oid"], key, "open", o["side"], o["px"], o["sz"]))
+            out.append(PlaceResult(PlaceKind.RESTING, oid=o["oid"], latency_ms=self.latency_ms))
+        return out
+
+    async def cancel_oids(self, oids):
+        self.bulk_cancel_calls += 1
+        return [await self.cancel_oid(o) for o in oids]
+
+    async def cancel_cloids(self, cloids):
+        self.bulk_cancel_calls += 1
+        return [await self.cancel(c) for c in cloids]
+
     async def cancel(self, cloid):
         self.cancel_calls.append(cloid)
         o = self.orders.pop(cloid, None)
@@ -89,6 +136,9 @@ class FakeGateway:
         for c, o in list(self.orders.items()):
             if o["oid"] == oid:
                 return await self.cancel(c)
+        # Record the attempt even for an order the fake never saw (e.g. one registered
+        # directly with the OrderManager by a test): the exchange round trip happened.
+        self.cancel_calls.append(str(oid))
         return CancelResult(True)
 
     async def cancel_all(self):

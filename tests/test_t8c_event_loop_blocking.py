@@ -38,7 +38,7 @@ class SlowGateway(FakeGateway):
     async def place_alo(self, side, price, size, cloid):
         self.placing = True
         try:
-            await asyncio.wait_for(self.gate.wait(), timeout=5.0)
+            await self.gate.wait()
         finally:
             self.placing = False
         return await super().place_alo(side, price, size, cloid)
@@ -81,33 +81,31 @@ def test_fill_is_applied_while_cycle_awaits_a_rest_call():
             assert applied, ("fill waited behind the quoting cycle's REST call: local pos still "
                              f"{bot.pos.size} after the REST was in flight")
         finally:
+            bot.stop_event.set()                     # let event_loop() drain and exit on its own
             gw.gate.set()                            # release the cycle
-            for t in (task, cycle_task):
-                if t is not None:
-                    t.cancel()
-            for t in (task, cycle_task):
-                if t is not None:
-                    try:
-                        await t
-                    except asyncio.CancelledError:
-                        pass
+            cycle_task.cancel()
+            await asyncio.gather(task, cycle_task, return_exceptions=True)
             await asyncio.sleep(0)
     run(go())
 
 
-class SlowCancelGateway(FakeGateway):
-    """cancel() blocks on a gate -> a deterministic window between compute_quotes() and places."""
+class SlowModifyGateway(FakeGateway):
+    """modify_quotes() blocks on a gate -> a deterministic window between compute_quotes() and
+    the re-read of inventory."""
 
     def __init__(self):
         super().__init__()
         self.gate = asyncio.Event()
         self.gate.set()                              # open: cycle 1 places normally
-        self.cancelling = False
+        self.modifying = False
 
-    async def cancel(self, cloid):
-        self.cancelling = True
-        await asyncio.wait_for(self.gate.wait(), timeout=5.0)
-        return await super().cancel(cloid)
+    async def modify_quotes(self, modifies):
+        self.modifying = True
+        try:
+            await self.gate.wait()
+        finally:
+            self.modifying = False
+        return await super().modify_quotes(modifies)
 
 
 async def pump(bot, gw):
@@ -116,9 +114,9 @@ async def pump(bot, gw):
 
 
 def test_quote_sizing_is_re_read_right_before_placing():
-    """REQ-0029: a fill landing during the cancel RESTs must be reflected in the quotes placed."""
+    """REQ-0029: a fill landing during the modify RESTs must be reflected in the resting quotes."""
     async def go():
-        gw = SlowCancelGateway()
+        gw = SlowModifyGateway()
         clk = Clock()
         bot = Bot(gw, PARAMS, RISK, now_fn=clk)
         await bot.init()
@@ -128,25 +126,32 @@ def test_quote_sizing_is_re_read_right_before_placing():
         await bot.cycle()                            # cycle 1: two quotes resting at inventory 0
         await pump(bot, gw)
         assert len(gw.orders) == 2
-        gw.gate.clear()                              # the repricing cancels will block
+        gw.gate.clear()                              # the repricing modify will block
         gw.set_book(70014, 70016)                    # ~2.1 bps: reprice both sides, no order fills
         await pump(bot, gw)
         task = asyncio.create_task(bot.cycle())
         try:
-            assert await wait_until(lambda: gw.cancelling), "cycle never reached a cancel REST"
-            await bot.handle_event(FillEvent("BTC", Side.BUY, 70006.0, 0.00017, 1, 990002, 0.0, 0.0, False))
-            assert abs(bot.pos.size - 0.00017) < 1e-12
+            assert await wait_until(lambda: gw.modifying), "cycle never reached a modify REST"
+            await bot.handle_event(FillEvent("BTC", Side.BUY, 70006.0, 0.0005, 1, 990002, 0.0, 0.0, False))
+            assert abs(bot.pos.size - 0.0005) < 1e-12
             gw.gate.set()
             await task
         finally:
             gw.gate.set()
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         fresh = compute_quotes(bot.market, bot.pos.size, PARAMS, gw.spec)
         stale = compute_quotes(bot.market, 0.0, PARAMS, gw.spec)
         assert fresh != stale, "sanity: inventory skew must move the targets"
-        placed = [(side, px, sz) for side, px, sz, _ in gw.place_calls]
+        assert len(gw.orders) == 2
         for q in fresh:
-            hit = any(side is q.side and abs(px - q.price) < 1e-9 and abs(sz - q.size) < 1e-12
-                      for side, px, sz in placed)
-            assert hit, (f"placed {q.side.value} quote does not use the post-fill inventory: "
-                         f"placed={placed} fresh={[(x.side, x.price, x.size) for x in fresh]}")
+            hit = any(o["side"] is q.side and abs(o["px"] - q.price) < 1e-9
+                      and abs(o["sz"] - q.size) < 1e-12 for o in gw.orders.values())
+            assert hit, (f"resting {q.side.value} quote does not use the post-fill inventory: "
+                         f"resting={[(o['side'], o['px'], o['sz']) for o in gw.orders.values()]} "
+                         f"fresh={[(x.side, x.price, x.size) for x in fresh]}")
     run(go())

@@ -554,7 +554,9 @@ class Bot:
             r = await self.gw.user_rate_limit()
             after = int(float(r.get("nRequestsUsed", before_used)))
             verdict = calibrate_costs(before_used, after, n_legs)
-            if verdict in ("call", "leg"):
+            # Only a multi-leg sample can distinguish call from leg; keep the
+            # configured mode and retry on the next multi-leg batch otherwise.
+            if verdict in ("call", "leg") and n_legs > 1:
                 self.batch_planner.mode = verdict
                 self._calibration_done = True
             self.budget.update_from_api(r)

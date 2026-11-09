@@ -171,6 +171,8 @@ def test_calibration_verdicts():
     assert calibrate_costs(100, 102, 2) == "leg"
     assert calibrate_costs(100, 100, 2) == "unknown"
     assert calibrate_costs(100, 105, 2) == "mixed"
+    # A 1-leg sample is ambiguous: never downgrade a known per-leg account.
+    assert calibrate_costs(100, 101, 1) == "unknown"
 
 
 def test_effective_half_spread_widens_smoothly():

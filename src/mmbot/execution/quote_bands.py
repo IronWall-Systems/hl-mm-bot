@@ -360,7 +360,10 @@ def calibrate_costs(before_used: int, after_used: int, n_legs: int) -> str:
     if delta <= 0:
         return "unknown"
     if delta == 1:
-        return "call"
+        # A single leg costs 1 under either model, so a 1-leg sample carries
+        # no information.  Treating it as "call" used to downgrade a known
+        # per-leg account and silently undercount multi-leg burn.
+        return "call" if n_legs > 1 else "unknown"
     if n_legs > 1 and delta == n_legs:
         return "leg"
     return "mixed"

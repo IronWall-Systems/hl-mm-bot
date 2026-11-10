@@ -111,6 +111,10 @@ class BatchPlanner:
         """
         t, p, q = self.now(), self.bands, self.q
         H = self.h_eff()
+        # In "leg" mode every leg is billed, so a discretionary second leg
+        # (piggyback or optional ride-along) costs a credit without saving a
+        # request.  Only "call" mode gets the batched-request optimisation.
+        leg_mode = self.mode == "leg"
         toxic_set = {str(s).lower() for s in toxic}
         if urgent_risk and not toxic_set:
             toxic_set = {"buy", "sell"}
@@ -158,6 +162,11 @@ class BatchPlanner:
                     (nec if very else opt)[side] = Leg(side, "modify", tgt, new_sz, very,
                                                       "far-very" if very else "far")
             else:
+                if leg_mode:
+                    # Quote is still inside its band: leave it resting.  It will
+                    # move only when it becomes necessary (far-very) or hits
+                    # max_defer_s, never as a piggybacked second leg.
+                    continue
                 near_slack = d - (H - a)
                 far_slack = (H + far) - d
                 about_to_fire = near_slack <= q.piggy_near_frac * a or far_slack <= q.piggy_far_frac * far
@@ -167,9 +176,9 @@ class BatchPlanner:
 
         mod_legs = [l for l in nec.values() if l.kind == "modify"]
         cancel_legs = [l for l in nec.values() if l.kind == "cancel"]
-        if opt and (mod_legs or len(opt) >= 2 or piggy):
+        if opt and not leg_mode and (mod_legs or len(opt) >= 2 or piggy):
             mod_legs += [l for s, l in opt.items() if s not in nec]
-        if mod_legs:
+        if mod_legs and not leg_mode:
             taken = {l.side for l in mod_legs}
             mod_legs += [l for s, l in piggy.items() if s not in taken]
 

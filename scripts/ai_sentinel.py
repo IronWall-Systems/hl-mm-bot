@@ -51,9 +51,36 @@ CRITICAL_LOSS_USD = 1.20
 DEAD_FEED_S = 10.0
 REJECT_CRITICAL_5M = 10
 
-AUTH_USER_ID = 6029973681
+# Every ID allowed to operate the bot; also receives sentinel alerts.
+AUTH_USER_IDS = {6029973681, 7752127491}
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", str(AUTH_USER_ID))
+
+
+def _parse_ids(raw: str) -> list:
+    """Parse a comma/semicolon separated id list, preserving order."""
+    ids = []
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value not in ids:
+            ids.append(value)
+    return ids
+
+
+# Alerts fan out to all operators.  TELEGRAM_CHAT_IDS overrides
+# TELEGRAM_CHAT_ID; authorized operators are always included.
+TG_CHATS = (_parse_ids(os.environ.get("TELEGRAM_CHAT_IDS", ""))
+            or _parse_ids(os.environ.get("TELEGRAM_CHAT_ID", ""))
+            or sorted(AUTH_USER_IDS))
+for _uid in sorted(AUTH_USER_IDS):
+    if _uid not in TG_CHATS:
+        TG_CHATS.append(_uid)
+TG_CHAT = TG_CHATS[0]
 
 SYSTEM_PROMPT = """You are a senior quantitative trader supervising a live HYPE perpetual market-making bot.
 You receive ONLY a compact deterministic digest. You have no other context and no tools.
@@ -348,17 +375,21 @@ def send_telegram(text: str) -> None:
     if not TG_TOKEN:
         log("telegram skipped: no token")
         return
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
-                                "disable_web_page_preview": True}, timeout=15)
-        data = r.json()
-        if data.get("ok"):
-            log(f"telegram sent message_id={data['result']['message_id']}")
-        else:
-            log(f"telegram send failed: {data.get('description')}")
-    except Exception as exc:
-        log(f"telegram send failed: {type(exc).__name__}: {exc}")
+    for chat_id in TG_CHATS:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json={"chat_id": chat_id, "text": text,
+                                    "parse_mode": "HTML",
+                                    "disable_web_page_preview": True}, timeout=15)
+            data = r.json()
+            if data.get("ok"):
+                log(f"telegram sent chat={chat_id} "
+                    f"message_id={data['result']['message_id']}")
+            else:
+                log(f"telegram send failed chat={chat_id}: {data.get('description')}")
+        except Exception as exc:
+            log(f"telegram send failed chat={chat_id}: "
+                f"{type(exc).__name__}: {exc}")
 
 
 def emergency_stop(reason: str) -> None:

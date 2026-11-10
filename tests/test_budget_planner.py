@@ -338,6 +338,58 @@ class _GwStub:
     spec = _SpecStub()
 
 
+def _plan_legs(mode: str, live, ref: float = 100.0, tgt=None):
+    clock = [0.0]
+    bp = BatchPlanner(_fresh_budget(clock), BandParams(), charge_mode=mode,
+                      now=lambda: clock[0])
+    tgt = tgt or {"buy": 0.15, "sell": 0.15}
+    return [l for p in bp.plan(live, ref, tgt) for l in p.legs]
+
+
+def test_leg_mode_drops_piggyback_second_leg():
+    # Buy sits 15 bps out (2 bps inside the 13 bps near edge) so call mode
+    # rides it along as a free second leg on the sell's necessary re-quote.
+    # In leg mode that piggy leg costs a credit and must be dropped.
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 15.0), 0.15, 0.0),
+            "sell": LiveQuote(2, target_px("sell", ref, 10.0), 0.15, 0.0)}
+
+    call_legs = _plan_legs("call", live, ref)
+    leg_legs = _plan_legs("leg", live, ref)
+
+    assert any(l.why == "piggy" for l in call_legs)
+    assert not any(l.why == "piggy" for l in leg_legs)
+    assert {l.why for l in leg_legs} == {"near"}
+
+
+def test_leg_mode_does_not_ride_optional_far_leg():
+    # Buy is merely "far" (45 bps, not far-very) and would ride along with the
+    # sell's necessary near re-quote in call mode.  Leg mode leaves it resting.
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 45.0), 0.15, 0.0),
+            "sell": LiveQuote(2, target_px("sell", ref, 10.0), 0.15, 0.0)}
+
+    call_legs = _plan_legs("call", live, ref)
+    leg_legs = _plan_legs("leg", live, ref)
+
+    assert {l.side for l in call_legs} == {"buy", "sell"}
+    assert {l.side for l in leg_legs} == {"sell"}
+
+
+def test_leg_mode_still_moves_far_very():
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 55.0), 0.15, 0.0), "sell": None}
+    legs = _plan_legs("leg", live, ref, {"buy": 0.15, "sell": 0.0})
+    assert [l.why for l in legs] == ["far-very"]
+
+
+def test_leg_mode_moves_far_leg_after_max_defer():
+    ref = 100.0
+    live = {"buy": LiveQuote(1, target_px("buy", ref, 45.0), 0.15, 300.0), "sell": None}
+    legs = _plan_legs("leg", live, ref, {"buy": 0.15, "sell": 0.0})
+    assert [l.why for l in legs] == ["far-very"]
+
+
 def test_inventory_cap_binds_at_two_fills_not_three():
     bot = Bot(_GwStub(), StrategyParams(coin="HYPE", quote_notional=12.0, max_notional=24.0),
               RiskConfig())

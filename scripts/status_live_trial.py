@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 for candidate in (ROOT / ".env", Path("/root/hl-mm-bot/.env")):
@@ -71,6 +71,25 @@ def _pct(values: List[float], p: float) -> Optional[float]:
 
 def _f(value: Optional[float], fmt: str = "{:.2f}", dash: str = "n/a") -> str:
     return dash if value is None else fmt.format(value)
+
+
+def _env_value(key: str, default: str = "") -> str:
+    """Read a key from the on-disk .env first, then the process environment.
+
+    The monitor is long-lived, so a value cached at import time goes stale as
+    soon as an operator edits .env (e.g. rotating HL_ACCOUNT_ADDRESS).  Reading
+    the file per call keeps the dashboard pointed at the active wallet without
+    requiring a restart.
+    """
+    for path in (ROOT / ".env", Path("/root/hl-mm-bot/.env")):
+        try:
+            vals = dotenv_values(path)
+        except Exception:
+            continue
+        value = vals.get(key)
+        if value:
+            return str(value).strip()
+    return os.environ.get(key, default)
 
 
 def read_events(path: Path = JSONL) -> List[Dict[str, Any]]:
@@ -150,20 +169,38 @@ def tmux_status(session: str = TMUX_SESSION) -> Dict[str, Any]:
             "created": created, "pids": pids}
 
 
-def exchange_state(coin: str = "BTC") -> Dict[str, Any]:
-    """Read-only account/order snapshot. Returns an ``error`` key on failure."""
+def exchange_state(coin: Optional[str] = None) -> Dict[str, Any]:
+    """Read-only account/order snapshot. Returns an ``error`` key on failure.
+
+    The wallet is re-read from .env on every call (see ``_env_value``) so a
+    rotated HL_ACCOUNT_ADDRESS cannot leave the dashboard pointed at an empty
+    legacy account.  An empty or malformed response is reported as an error
+    instead of being silently rendered as ``$0.00``.
+    """
+    coin = (coin or _env_value("HL_COIN", "HYPE")).upper()
     result: Dict[str, Any] = {"ok": False, "equity": None, "unrealized_pnl": None,
-                              "positions": [], "orders": [], "error": None}
+                              "positions": [], "orders": [], "orders_known": False,
+                              "address": None, "error": None}
     try:
         from hyperliquid.info import Info
-        addr = os.environ.get("HL_ACCOUNT_ADDRESS")
+        addr = _env_value("HL_ACCOUNT_ADDRESS")
         if not addr:
             raise RuntimeError("HL_ACCOUNT_ADDRESS missing")
-        info = Info(os.environ.get("HL_BASE_URL", "https://api.hyperliquid.xyz"),
+        if not (addr.startswith("0x") and len(addr) == 42):
+            raise RuntimeError(f"HL_ACCOUNT_ADDRESS malformed: {addr!r}")
+        result["address"] = addr
+        info = Info(_env_value("HL_BASE_URL", "https://api.hyperliquid.xyz"),
                     skip_ws=True, timeout=8)
         us = info.user_state(addr)
-        ms = us.get("marginSummary", {})
-        result["equity"] = float(ms.get("accountValue", 0.0))
+        if not isinstance(us, dict) or not us:
+            raise RuntimeError("empty user_state response")
+        ms = us.get("marginSummary") or {}
+        if "accountValue" not in ms:
+            raise RuntimeError("user_state missing marginSummary.accountValue")
+        equity = float(ms.get("accountValue"))
+        if not math.isfinite(equity):
+            raise RuntimeError(f"non-finite accountValue={equity!r}")
+        result["equity"] = equity
         result["unrealized_pnl"] = 0.0
         for p in us.get("assetPositions", []):
             pos = p.get("position", {})
@@ -179,14 +216,20 @@ def exchange_state(coin: str = "BTC") -> Dict[str, Any]:
                 })
                 result["unrealized_pnl"] = (result["unrealized_pnl"] or 0.0) + \
                     float(pos.get("unrealizedPnl") or 0.0)
-        for o in info.open_orders(addr):
-            if o.get("coin") != coin:
-                continue
-            result["orders"].append({
-                "oid": o.get("oid"), "side": o.get("side"),
-                "price": float(o.get("limitPx") or 0.0),
-                "size": float(o.get("sz") or 0.0),
-            })
+        # Orders are a separate call: a transient failure there must not throw
+        # away an otherwise valid equity/position snapshot.
+        try:
+            for o in info.open_orders(addr):
+                if o.get("coin") != coin:
+                    continue
+                result["orders"].append({
+                    "oid": o.get("oid"), "side": o.get("side"),
+                    "price": float(o.get("limitPx") or 0.0),
+                    "size": float(o.get("sz") or 0.0),
+                })
+            result["orders_known"] = True
+        except Exception as exc:
+            result["error"] = f"open_orders: {type(exc).__name__}: {exc}"
         result["ok"] = True
     except Exception as exc:  # read-only best effort; never raise into callers
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -223,10 +266,48 @@ def build_metrics(events: List[Dict[str, Any]], ex: Dict[str, Any]) -> Dict[str,
             mark[key].append(float(e["markout_bps"]))
 
     last_ts = max((float(e.get("ts", 0.0)) for e in session), default=None)
-    equity = ex.get("equity") if ex.get("ok") else None
-    if equity is None:
-        eq_events = [e for e in session if e.get("event") == "equity"]
-        equity = float(eq_events[-1]["equity"]) if eq_events else None
+
+    # The bot writes an `equity` event every few seconds from its own live
+    # exchange snapshot.  Use it as an independent source of truth so a bad
+    # monitor-side query (stale wallet, empty response) cannot render $0.00.
+    eq_events = [e for e in session if e.get("event") == "equity"]
+    last_eq = eq_events[-1] if eq_events else None
+    eq_ts = float(last_eq["ts"]) if last_eq and last_eq.get("ts") else None
+    telemetry_fresh = (now - eq_ts) <= 120.0 if eq_ts else False
+    telemetry_equity = (float(last_eq["equity"])
+                        if last_eq and last_eq.get("equity") is not None else None)
+    telemetry_pos = (float(last_eq["position"])
+                     if last_eq and last_eq.get("position") is not None else None)
+    telemetry_upnl = (float(last_eq["unrealized_pnl"])
+                      if last_eq and last_eq.get("unrealized_pnl") is not None else None)
+
+    ex_ok = bool(ex.get("ok"))
+    ex_equity = ex.get("equity") if ex_ok else None
+    # A non-positive account snapshot while the bot's own fresh telemetry says
+    # the account is funded is a stale/failed read, not a real wipeout.
+    stale_snapshot = (ex_equity is not None and ex_equity <= 0
+                      and telemetry_fresh and (telemetry_equity or 0.0) > 0)
+    exchange_error = ex.get("error")
+    if stale_snapshot and not exchange_error:
+        exchange_error = (f"exchange returned non-positive equity ({ex_equity}); "
+                          f"using bot telemetry")
+
+    equity = None if stale_snapshot else ex_equity
+    equity_source = "exchange" if equity is not None else None
+    if equity is None and telemetry_fresh:
+        equity = telemetry_equity
+        equity_source = "telemetry" if equity is not None else None
+
+    if stale_snapshot:
+        position = telemetry_pos
+        unrealized_pnl = telemetry_upnl
+        orders_known = False
+    else:
+        position = (sum(p["size"] for p in ex.get("positions", []))
+                    if ex_ok else (telemetry_pos if telemetry_fresh else None))
+        unrealized_pnl = (ex.get("unrealized_pnl") if ex_ok
+                          else (telemetry_upnl if telemetry_fresh else None))
+        orders_known = bool(ex_ok and ex.get("orders_known"))
 
     pnl = (equity - start_equity) if equity is not None else None
     pnl_bps = (pnl / start_equity * 1e4) if pnl is not None and start_equity else None
@@ -238,13 +319,16 @@ def build_metrics(events: List[Dict[str, Any]], ex: Dict[str, Any]) -> Dict[str,
         "uptime_s": (now - started_at) if started_at else None,
         "heartbeat_age_s": (now - last_ts) if last_ts else None,
         "equity": equity,
+        "equity_source": equity_source,
         "pnl": pnl,
         "pnl_bps": pnl_bps,
-        "unrealized_pnl": ex.get("unrealized_pnl") if ex.get("ok") else None,
+        "unrealized_pnl": unrealized_pnl,
         "hard_stop_equity": start_equity - HARD_STOP_USD,
         "stop_distance": (equity - (start_equity - HARD_STOP_USD)) if equity is not None else None,
-        "position": sum(p["size"] for p in ex.get("positions", [])) if ex.get("ok") else None,
+        "position": position,
         "orders": ex.get("orders", []),
+        "orders_known": orders_known,
+        "exchange_address": ex.get("address"),
         "requotes": len(modify_lat),
         "parks": len(parks),
         "fills": len(fills),
@@ -255,7 +339,7 @@ def build_metrics(events: List[Dict[str, Any]], ex: Dict[str, Any]) -> Dict[str,
         "cancel_lat": cancel_lat,
         "markout": mark,
         "recent_fills": fills[-10:],
-        "exchange_error": ex.get("error"),
+        "exchange_error": exchange_error,
     }
 
 
@@ -297,10 +381,13 @@ def render_status(detail: bool = False) -> str:
             px = f"{o['price']:.3f}" if o["price"] < 1000 else f"{o['price']:.1f}"
             lines.append(f"{name}: <b>{px}</b> × {o['size']:.5f} "
                          f"(<code>{o['oid']}</code>) · ${o['price'] * o['size']:.2f}")
-    else:
+    elif m["orders_known"]:
         lines.append("No resting orders")
-    if not ex.get("ok"):
-        lines.append(f"⚠️ exchange read failed: {m['exchange_error']}")
+    else:
+        lines.append("Resting orders: n/a (exchange read unavailable)")
+    if m["equity_source"] != "exchange" or not m["orders_known"]:
+        reason = m["exchange_error"] or "incomplete exchange snapshot"
+        lines.append(f"⚠️ exchange read: {html.escape(str(reason))}")
 
     mod = m["modify_lat"]
     lines += [

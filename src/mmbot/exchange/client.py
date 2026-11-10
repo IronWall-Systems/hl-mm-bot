@@ -61,7 +61,7 @@ class Gateway(Protocol):
     async def cancel_oids(self, oids: List[int]) -> List[CancelResult]: ...
     async def cancel_cloids(self, cloids: List[str]) -> List[CancelResult]: ...
     async def cancel_all(self) -> int: ...
-    async def flatten(self) -> None: ...
+    async def flatten(self, slippage: float = 0.05) -> None: ...
     async def account_state(self) -> PositionState: ...
     async def open_orders(self) -> List[RemoteOrder]: ...
     async def user_rate_limit(self) -> dict: ...
@@ -687,13 +687,15 @@ class HyperliquidGateway:
             log.info("cancel_all(%d) -> bulk_cancel", len(rows))
         return len(rows)
 
-    async def flatten(self) -> None:
+    async def flatten(self, slippage: float = 0.05) -> None:
         if self.dry_run:
             log.info("[dry-run] flatten")
             return
         async with self._lock:
-            resp = await asyncio.to_thread(self.exchange.market_close, self.coin)
-        log.warning("flatten -> %s", _redact(json.dumps(resp, default=str)))
+            resp = await asyncio.to_thread(self.exchange.market_close, self.coin,
+                                           slippage=slippage)
+        log.warning("flatten slippage=%.2f -> %s", slippage,
+                    _redact(json.dumps(resp, default=str)))
 
     async def account_state(self) -> PositionState:
         us = await asyncio.to_thread(self.info.user_state, self.addr)

@@ -351,7 +351,8 @@ def invoke_ai(digest: Dict[str, Any]) -> Dict[str, Any]:
         log(f"AI invoke failed: {type(exc).__name__}: {exc}")
         return {"action": "HOLD_NORMAL", "confidence": 0.0,
                 "reason": "AI CLI unavailable; digest logged deterministically",
-                "telegram": "", "raw": "", "elapsed_s": round(time.time() - t0, 2)}
+                "telegram": "", "raw": "", "source": "deterministic",
+                "elapsed_s": round(time.time() - t0, 2)}
     text = re.sub(r"\x1b\[[0-9;]*m", "", raw)
     parsed: Optional[Dict[str, Any]] = None
     for i, ch in enumerate(text):
@@ -365,7 +366,9 @@ def invoke_ai(digest: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         parsed = {"action": "HOLD_NORMAL", "confidence": 0.0,
                   "reason": "unparseable AI response; deterministic digest logged",
-                  "telegram": ""}
+                  "telegram": "", "source": "deterministic"}
+    else:
+        parsed["source"] = "ai"
     parsed["raw"] = text[-1200:]
     parsed["elapsed_s"] = round(time.time() - t0, 2)
     return parsed
@@ -468,6 +471,7 @@ def run_once(force: bool = False) -> Dict[str, Any]:
     action = execute_action(str(result.get("action", "")), result, digest)
     state.update({"last_review_ts": now, "last_digest_ts": now,
                   "last_action": action,
+                  "last_review_source": str(result.get("source", "ai")),
                   "last_confidence": float(result.get("confidence", 0.0) or 0.0),
                   "last_reason": str(result.get("reason", ""))[:300],
                   "last_telegram": str(result.get("telegram", ""))[:600],
@@ -483,8 +487,25 @@ def main() -> None:
     ap.add_argument("--once", action="store_true", help="run one check and exit")
     ap.add_argument("--review-now", action="store_true",
                     help="force an on-demand stateless review and notify Telegram")
+    ap.add_argument("--digest-only", action="store_true",
+                    help="build/log the deterministic digest and refresh its "
+                         "timestamp without invoking the AI or taking action")
     args = ap.parse_args()
 
+    if args.digest_only:
+        digest = build_digest()
+        payload = json.dumps(digest, separators=(",", ":"))
+        now = time.time()
+        state = load_state()
+        state["last_digest_ts"] = now
+        state["last_digest_flags"] = digest.get("flags", [])
+        state["last_digest_critical"] = bool(digest.get("critical"))
+        save_state(state)
+        log(f"digest-only tokens~{max(1, len(payload) // 4)} "
+            f"bytes={len(payload)} flags={digest['flags']} "
+            f"critical={digest['critical']}")
+        print(json.dumps(digest, indent=2, default=str))
+        return
     log(f"ai_sentinel start model={MODEL} interval={CHECK_INTERVAL_S}s "
         f"review={SCHEDULED_REVIEW_S}s token_cap=250 stateless=true")
     if args.once or args.review_now:

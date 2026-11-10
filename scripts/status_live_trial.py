@@ -16,6 +16,7 @@ import html
 import json
 import math
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ JSONL = Path(os.environ.get("HL_LIVE_JSONL",
                             ROOT / "logs" / "live_trial_20261107_hype.jsonl"))
 CONSOLE = JSONL.with_suffix("").with_suffix(".console.log")
 AI_STATE = ROOT / "logs" / "ai_sentinel_state.json"
+AI_LOG = ROOT / "logs" / "ai_sentinel.log"
 TMUX_SESSION = "live_trial"
 HARD_STOP_USD = 2.00
 DEFAULT_START_EQUITY = 24.29537
@@ -73,6 +75,27 @@ def _f(value: Optional[float], fmt: str = "{:.2f}", dash: str = "n/a") -> str:
     return dash if value is None else fmt.format(value)
 
 
+def fmt_usd(value: Optional[float], decimals: int = 2, signed: bool = False,
+            dash: str = "n/a") -> str:
+    """Format USD with the sign *before* the dollar sign.
+
+    ``fmt_usd(-0.08748, 2, signed=True) -> "-$0.09"``.  Tiny rounding residue
+    is normalised to zero so the panel never renders ``-$0.00``.
+    """
+    if value is None:
+        return dash
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return dash
+    if not math.isfinite(value):
+        return dash
+    if abs(value) < 0.5 * 10 ** (-decimals):
+        value = 0.0
+    sign = "-" if value < 0 else ("+" if signed else "")
+    return f"{sign}${abs(value):,.{decimals}f}"
+
+
 def _env_value(key: str, default: str = "") -> str:
     """Read a key from the on-disk .env first, then the process environment.
 
@@ -111,22 +134,143 @@ def read_events(path: Path = JSONL) -> List[Dict[str, Any]]:
     return out
 
 
+def latest_guard() -> Dict[str, Optional[float]]:
+    """Loss-guard thresholds/start equity recorded by the live bot at startup."""
+    ev = read_events()
+    lg = next((e for e in reversed(ev) if e.get("event") == "loss_guard"), None)
+    if not lg:
+        return {}
+    return {"soft": lg.get("soft_loss_usd"),
+            "hard": lg.get("hard_loss_usd"),
+            "start": lg.get("start_equity")}
+
+
+_AI_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(.*)$")
+_AI_ACTIONS = ("HOLD_NORMAL", "WARN_TELEGRAM", "DEFENSIVE_PAUSE",
+               "EMERGENCY_FLATTEN")
+
+
+def _sentinel_log_scan(max_lines: int = 800) -> Dict[str, Any]:
+    """Latest digest-check and AI-review records from the sentinel log.
+
+    The state file only advances ``last_review_ts`` when an AI evaluation is
+    invoked; the log also records every deterministic digest check.  Reading
+    both keeps the panel's timestamp from freezing at the last review while the
+    AI CLI is unavailable.
+    """
+    out: Dict[str, Any] = {"check_ts": None, "review_ts": None,
+                           "action": None, "reason": None,
+                           "elapsed_s": None}
+    if not AI_LOG.exists():
+        return out
+    try:
+        # Read only the tail: the sentinel log grows forever and the panel only
+        # needs the most recent review/digest records.
+        with AI_LOG.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 256_000))
+            text = fh.read().decode("utf-8", "replace")
+        lines = text.splitlines()[-max_lines:]
+    except OSError:
+        return out
+    for raw in lines:
+        m = _AI_LOG_TS.match(raw.strip())
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        msg = m.group(2)
+        if msg.startswith(("digest ", "digest-only ")):
+            out["check_ts"] = ts
+        elif msg.startswith("AI action="):
+            am = re.match(r"AI action=(\w+)\s+elapsed=([\d.]+)s\s+reason=(.*)$",
+                          msg)
+            if am:
+                out["review_ts"] = ts
+                out["action"] = am.group(1)
+                out["elapsed_s"] = float(am.group(2))
+                out["reason"] = am.group(3).strip()
+        elif msg.startswith("AI "):
+            action, sep, reason = msg[3:].partition(":")
+            action = action.strip()
+            if sep and action in _AI_ACTIONS:
+                out["review_ts"] = ts
+                out["action"] = action
+                out["reason"] = reason.strip()
+    return out
+
+
 def read_ai_review() -> Optional[Dict[str, Any]]:
-    """Latest cached AI review from the sentinel state file (read-only)."""
+    """Latest AI review/digest, merged from state file and sentinel log.
+
+    The panel must never show a hardcoded startup timestamp.  When the AI CLI
+    is unavailable the meaningful timestamp is the latest deterministic digest
+    check, so ``ts`` follows ``check_ts`` in that case.  A genuine AI review
+    keeps its own evaluation timestamp and the digest time is shown separately.
+    """
+    state: Dict[str, Any] = {}
     try:
         state = json.loads(AI_STATE.read_text())
     except (OSError, json.JSONDecodeError):
+        state = {}
+    log = _sentinel_log_scan()
+
+    state_review_ts = float(state.get("last_review_ts") or 0.0)
+    state_digest_ts = float(state.get("last_digest_ts") or 0.0)
+    log_review_ts = float(log["review_ts"] or 0.0)
+    log_check_ts = float(log["check_ts"] or 0.0)
+
+    review_ts = max(state_review_ts, log_review_ts)
+    check_ts = max(state_digest_ts, log_check_ts, review_ts)
+
+    if state_review_ts >= log_review_ts and state.get("last_action"):
+        action = str(state.get("last_action", "HOLD_NORMAL"))
+        reason = str(state.get("last_reason", ""))
+        confidence = (None if state.get("last_confidence") is None
+                      else float(state.get("last_confidence") or 0.0))
+        telegram = str(state.get("last_telegram", ""))
+        elapsed_s = state.get("last_elapsed_s")
+        source = state.get("last_review_source")
+    else:
+        action = str(log["action"] or "HOLD_NORMAL")
+        reason = str(log["reason"] or "")
+        confidence = None
+        telegram = ""
+        elapsed_s = log["elapsed_s"]
+        source = None
+
+    if source not in ("ai", "deterministic"):
+        low = reason.lower()
+        if "cli unavailable" in low or "unparseable ai response" in low:
+            source = "deterministic"
+        elif review_ts:
+            source = "ai"
+        else:
+            source = "deterministic"
+
+    if not review_ts and not check_ts:
         return None
-    if not state.get("last_review_ts") or not state.get("last_action"):
-        return None
+    if not review_ts:
+        action = "HOLD_NORMAL"
+        reason = "No AI evaluation yet; deterministic digest only"
+        confidence = None
+        source = "deterministic"
+
+    display_ts = check_ts if source == "deterministic" else review_ts
     return {
-        "ts": float(state.get("last_review_ts", 0.0)),
-        "action": str(state.get("last_action", "")),
-        "confidence": (None if state.get("last_confidence") is None
-                       else float(state.get("last_confidence") or 0.0)),
-        "reason": str(state.get("last_reason", "")),
-        "telegram": str(state.get("last_telegram", "")),
-        "elapsed_s": state.get("last_elapsed_s"),
+        "ts": display_ts,
+        "review_ts": review_ts or None,
+        "check_ts": check_ts or None,
+        "action": action,
+        "confidence": confidence,
+        "reason": reason,
+        "telegram": telegram,
+        "elapsed_s": elapsed_s,
+        "source": source,
     }
 
 
@@ -246,6 +390,21 @@ def build_metrics(events: List[Dict[str, Any]], ex: Dict[str, Any]) -> Dict[str,
     session = events[startup_idx:] if startup_idx >= 0 else events
     start_equity = float(startup["equity"]) if startup and startup.get("equity") else DEFAULT_START_EQUITY
     started_at = float(startup["ts"]) if startup and startup.get("ts") else None
+    # The live bot records the LossGuard thresholds at startup.  Prefer them over
+    # the legacy $2.00 constant so the panel shows the belt that actually binds.
+    lg = next((e for e in reversed(events) if e.get("event") == "loss_guard"), None)
+    if (lg is not None and started_at is not None
+            and float(lg.get("ts") or 0.0) < started_at - 5.0):
+        lg = None                              # stale guard record from an earlier run
+    guard_soft = (float(lg["soft_loss_usd"])
+                  if lg and lg.get("soft_loss_usd") is not None else None)
+    guard_hard = (float(lg["hard_loss_usd"])
+                  if lg and lg.get("hard_loss_usd") is not None else None)
+    guard_start = (float(lg["start_equity"])
+                   if lg and lg.get("start_equity") is not None else None)
+    if guard_start and guard_start > 0:
+        start_equity = guard_start            # same source the guard uses
+    hard_usd = guard_hard if guard_hard is not None else HARD_STOP_USD
 
     def lat(kind: str) -> List[float]:
         return [float(e["latency_ms"]) for e in session
@@ -323,8 +482,11 @@ def build_metrics(events: List[Dict[str, Any]], ex: Dict[str, Any]) -> Dict[str,
         "pnl": pnl,
         "pnl_bps": pnl_bps,
         "unrealized_pnl": unrealized_pnl,
-        "hard_stop_equity": start_equity - HARD_STOP_USD,
-        "stop_distance": (equity - (start_equity - HARD_STOP_USD)) if equity is not None else None,
+        "hard_stop_equity": start_equity - hard_usd,
+        "stop_distance": (equity - (start_equity - hard_usd)) if equity is not None else None,
+        "guard_soft_usd": guard_soft,
+        "guard_hard_usd": hard_usd,
+        "guard_start_equity": start_equity,
         "position": position,
         "orders": ex.get("orders", []),
         "orders_known": orders_known,
@@ -358,6 +520,11 @@ def render_status(detail: bool = False) -> str:
         runner = f"tmux <code>{TMUX_SESSION}</code>"
     else:
         runner = "no supervisor"
+    guard_soft = m.get("guard_soft_usd")
+    soft_line = (f"Soft stop: {fmt_usd(m['guard_start_equity'] - guard_soft, 5)} "
+                 f"(−{fmt_usd(guard_soft, 2)}) · distance "
+                 f"{fmt_usd(m['equity'] - (m['guard_start_equity'] - guard_soft), 2)}"
+                 if guard_soft is not None and m.get("equity") is not None else None)
     lines = [
         f"🟢 <b>LIVE TRIAL — {coin}</b>",
         f"🕒 {_utc(m['now'])}",
@@ -366,11 +533,14 @@ def render_status(detail: bool = False) -> str:
         f"<b>Uptime:</b> {_ago(m['uptime_s'])} · <b>Heartbeat:</b> {_ago(m['heartbeat_age_s'])} ago",
         "",
         "<b>EQUITY &amp; SAFETY BELTS</b>",
-        f"Perp equity: <b>${_f(m['equity'], '{:.5f}')}</b>",
-        f"Net PnL: <b>{_f(m['pnl'], '{:+.5f}')} USD</b> ({_f(m['pnl_bps'], '{:+.2f}')} bps)",
-        f"Unrealized PnL: {_f(m['unrealized_pnl'], '{:+.5f}')} USD",
-        f"Hard stop: ${m['hard_stop_equity']:.5f} (−$2.00) · "
-        f"<b>distance {_f(m['stop_distance'], '${:.5f}')}</b>",
+        f"Perp equity: <b>{fmt_usd(m['equity'], 5)}</b>",
+        f"Net PnL: <b>{fmt_usd(m['pnl'], 2, signed=True)}</b> "
+        f"({_f(m['pnl_bps'], '{:+.2f}')} bps)",
+        f"Unrealized PnL: {fmt_usd(m['unrealized_pnl'], 2, signed=True)}",
+        f"Hard stop: {fmt_usd(m['hard_stop_equity'], 5)} "
+        f"(−{fmt_usd(m['guard_hard_usd'], 2)}) · "
+        f"<b>distance {fmt_usd(m['stop_distance'], 2)}</b>",
+        *([soft_line] if soft_line else []),
         "",
         "<b>ACTIVE QUOTES &amp; INVENTORY</b>",
         f"Net position: <b>{_f(m['position'], '{:.6f}')}</b> {coin}",
@@ -380,7 +550,8 @@ def render_status(detail: bool = False) -> str:
             name = "Bid" if o["side"] == "B" else "Ask"
             px = f"{o['price']:.3f}" if o["price"] < 1000 else f"{o['price']:.1f}"
             lines.append(f"{name}: <b>{px}</b> × {o['size']:.5f} "
-                         f"(<code>{o['oid']}</code>) · ${o['price'] * o['size']:.2f}")
+                         f"(<code>{o['oid']}</code>) · "
+                         f"{fmt_usd(o['price'] * o['size'], 2)}")
     elif m["orders_known"]:
         lines.append("No resting orders")
     else:
@@ -397,7 +568,8 @@ def render_status(detail: bool = False) -> str:
         f"batchModify: p50 {_f(_pct(mod, .5), '{:.1f}')} / p95 {_f(_pct(mod, .95), '{:.1f}')}"
         f" / max {_f(max(mod) if mod else None, '{:.1f}')} ms",
         f"OTM parks: <b>{m['parks']}</b>",
-        f"Fills: <b>{m['fills']}</b> · fees/rebates: ${_f(m['fees'], '{:.4f}')}",
+        f"Fills: <b>{m['fills']}</b> · fees/rebates: "
+        f"{fmt_usd(-m['fees'], 4, signed=True)}",
         "Markout 1s/5s/30s: " + " / ".join(
             f"{_f(_pct(m['markout'][k], .5), '{:+.2f}')}" for k in ("1s", "5s", "30s")) + " bps",
     ]
@@ -415,7 +587,8 @@ def render_status(detail: bool = False) -> str:
         if m["recent_fills"]:
             for f in m["recent_fills"]:
                 lines.append(f"{_utc(f.get('ts'))} · {f.get('side')} {f.get('size')} @ "
-                             f"{f.get('px')} · fee ${float(f.get('fee') or 0):.5f}")
+                             f"{f.get('px')} · fee "
+                             f"{fmt_usd(-float(f.get('fee') or 0), 4, signed=True)}")
         else:
             lines.append("No fills yet")
         lines += ["", f"<b>Markout samples:</b> 1s {len(m['markout']['1s'])} · "
@@ -423,19 +596,25 @@ def render_status(detail: bool = False) -> str:
 
     ai = read_ai_review()
     if ai:
-        age = max(0.0, time.time() - ai["ts"])
+        now = time.time()
+        age = max(0.0, now - ai["ts"])
         conf = "n/a" if ai["confidence"] is None else f"{ai['confidence']:.2f}"
+        source = ("deterministic digest" if ai["source"] == "deterministic"
+                  else "AI review")
         lines += [
             "",
             "🧠 <b>AI QUANT REVIEW</b>",
             f"🕒 {_utc(ai['ts'])} ({_ago(age)} ago) · "
-            f"Action: <b>{html.escape(ai['action'])}</b> (conf {conf})",
+            f"Action: <b>{html.escape(ai['action'])}</b> (conf {conf}) · {source}",
         ]
+        if ai.get("check_ts") and abs(float(ai["check_ts"]) - float(ai["ts"])) >= 1:
+            lines.append(f"Last digest check: {_utc(ai['check_ts'])} "
+                         f"({_ago(max(0.0, now - float(ai['check_ts'])))} ago)")
         if ai["reason"]:
             lines.append(html.escape(ai["reason"]))
         if ai["telegram"]:
             lines.append(html.escape(ai["telegram"]))
-        if ai.get("elapsed_s") is not None:
+        if ai["source"] == "ai" and ai.get("elapsed_s") is not None:
             lines.append(f"<i>evaluated in {float(ai['elapsed_s']):.2f}s · "
                          f"stateless single-turn</i>")
 

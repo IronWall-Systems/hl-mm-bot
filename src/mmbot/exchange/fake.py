@@ -151,7 +151,7 @@ class FakeGateway:
             self.late_orders = []
         return n
 
-    async def flatten(self):
+    async def flatten(self, slippage: float = 0.05):
         self.flatten_calls += 1
         self.position = 0.0
 

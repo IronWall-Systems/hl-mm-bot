@@ -63,14 +63,21 @@ os.environ["MM_WALL_MIN_BPS"] = "12.0"
 os.environ["MM_WALL_MAX_BPS"] = "22.0"
 
 # ---- execution sizing + hard risk belts -------------------------------------
-os.environ["MM_QUOTE_NOTIONAL"] = "12.0"
+# 6-hour safety trial (2026-11-10): one $11 tranche, so a 4% adverse move is
+# ~$0.44 and the LossGuard thresholds are reachable before the old $2 belt.
+os.environ["MM_QUOTE_NOTIONAL"] = "11.0"
 os.environ["MM_MIN_ORDER_NOTIONAL"] = "10.0"
-os.environ["MM_MAX_NOTIONAL"] = "24.0"
+os.environ["MM_MAX_NOTIONAL"] = "11.0"
 os.environ["RISK_MAX_ORDER_NOTIONAL"] = "15.0"
 os.environ["RISK_MAX_POSITION_NOTIONAL"] = "30.0"
 os.environ["RISK_EMERGENCY_FLATTEN_NOTIONAL"] = "30.0"
-# Hard stop on $21.12 equity: $2.00 absolute loss -> floor $19.12.  The
-# percentage rules are looser backstops; the USD rule binds first (overnight).
+# Independent hard-loss guard (risk/loss_guard.py): soft -$0.50, hard -$0.80.
+# HARD -> cancel all, taker-flatten ladder, write HALT, exit 3 (4 if not flat).
+os.environ["RISK_LOSS_GUARD"] = "1"
+os.environ["RISK_SOFT_LOSS_USD"] = "0.50"
+os.environ["RISK_MAX_LOSS_USD"] = "0.80"
+os.environ.setdefault("RISK_HALT_FILE", str(ROOT / "logs" / "HALT"))
+# Older account-equity kill switch stays as a looser backstop.
 os.environ["RISK_MAX_ACCOUNT_LOSS_USD"] = "2.00"
 os.environ["RISK_MAX_DRAWDOWN_PCT"] = "0.10"
 os.environ["RISK_MAX_LOSS_PCT"] = "0.10"

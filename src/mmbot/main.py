@@ -19,6 +19,7 @@ import sys
 import time
 from collections import Counter, deque
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Callable, Deque, Optional, Set
 
 from .config import load_settings
@@ -32,10 +33,63 @@ from .models import (MarketState, MicroState, OrderStatus, PositionState, Quote,
                      StrategyParams)
 from .precision import round_px, round_sz, tick_at
 from .risk.guard import KillReason, RiskGuard
+from .risk.loss_guard import (GuardAction, LossGuard, LossGuardConfig,
+                              hard_stop_sequence)
 from .safety import cancel_sweep
 from .strategy.quoter import compute_quotes, toxic_sides
 
 log = logging.getLogger("mmbot")
+
+# Durable stop marker.  Lives under logs/ because that is the only path the
+# systemd unit grants write access to (ProtectSystem/ProtectHome are strict).
+HALT_DEFAULT = Path(__file__).resolve().parents[2] / "logs" / "HALT"
+
+
+def loss_guard_config_from_env(environ=None) -> Optional[LossGuardConfig]:
+    """Build the hard-loss guard config, or ``None`` to leave the guard off.
+
+    Enabled explicitly with ``RISK_LOSS_GUARD=1`` or implicitly when either
+    threshold is set (the live trial script sets both).  Tests and dry runs
+    therefore keep the old behaviour unless they opt in.
+    """
+    env = os.environ if environ is None else environ
+    flag = env.get("RISK_LOSS_GUARD")
+    if flag is not None:
+        enabled = flag.strip().lower() not in ("0", "false", "no", "off", "")
+    else:
+        enabled = "RISK_MAX_LOSS_USD" in env or "RISK_SOFT_LOSS_USD" in env
+    if not enabled:
+        return None
+    soft = float(env.get("RISK_SOFT_LOSS_USD", "0.50"))
+    hard = float(env.get("RISK_MAX_LOSS_USD", "0.80"))
+    if not (0.0 < soft < hard):
+        raise SystemExit(
+            f"invalid loss guard thresholds: RISK_SOFT_LOSS_USD={soft} "
+            f"RISK_MAX_LOSS_USD={hard} (need 0 < soft < hard)")
+    return LossGuardConfig(
+        soft_loss_usd=soft,
+        hard_loss_usd=hard,
+        poll_stale_s=float(env.get("RISK_GUARD_POLL_STALE_S", "20")),
+        unreadable_hard_s=float(env.get("RISK_GUARD_UNREADABLE_HARD_S", "90")),
+        soft_flat_deadline_s=float(env.get("RISK_GUARD_SOFT_DEADLINE_S", "1200")),
+        halt_file=env.get("RISK_HALT_FILE", str(HALT_DEFAULT)))
+
+
+class _LossGuardGateway:
+    """Adapt the exchange Gateway to the guard's minimal async protocol."""
+
+    def __init__(self, gw: Gateway):
+        self.gw = gw
+
+    async def cancel_all(self) -> int:
+        return await self.gw.cancel_all()
+
+    async def flatten(self, slippage: float = 0.05) -> None:
+        await self.gw.flatten(slippage)
+
+    async def position(self) -> float:
+        st = await self.gw.account_state()
+        return float(st.size)
 
 
 class ToxicityDebouncer:
@@ -96,6 +150,14 @@ class Bot:
         self.market: Optional[MarketState] = None
         self.pos = PositionState()
         self.guard: Optional[RiskGuard] = None
+        # Independent hard-loss guard (see risk/loss_guard.py).  Off unless
+        # RISK_LOSS_GUARD=1 or a threshold env var is present.
+        self.loss_cfg = loss_guard_config_from_env()
+        self.loss_guard: Optional[LossGuard] = None
+        self._guard_action: GuardAction = GuardAction.OK
+        self._soft_only = False          # SOFT: quote only the reducing side
+        self._pulled = False             # PULL: resting quotes already cancelled
+        self._hard_exit_code: Optional[int] = None
         self.halted = False
         self.kill_reason: Optional[KillReason] = None
         self.stop_event = asyncio.Event()
@@ -205,11 +267,31 @@ class Bot:
             raise RuntimeError("account value reads as 0: cannot enforce drawdown stop "
                                "(wrong address? unified-account mode? unfunded?). Refusing to start.")
         self.guard = RiskGuard(self.rcfg, self.pos.account_value, self.now)
+        if self.loss_cfg is not None:
+            self.loss_guard = LossGuard(self.pos.account_value, self.loss_cfg,
+                                        now=self.now,
+                                        halt_path=self.loss_cfg.halt_file)
+            log.warning("LOSS GUARD ENABLED: soft=-$%.2f hard=-$%.2f stale_pull=%.0fs "
+                        "unreadable_hard=%.0fs soft_deadline=%.0fs halt=%s "
+                        "start_equity=%.5f",
+                        self.loss_cfg.soft_loss_usd, self.loss_cfg.hard_loss_usd,
+                        self.loss_cfg.poll_stale_s, self.loss_cfg.unreadable_hard_s,
+                        self.loss_cfg.soft_flat_deadline_s, self.loss_guard.halt_path,
+                        self.pos.account_value)
+        else:
+            log.info("loss guard disabled (set RISK_LOSS_GUARD=1 or RISK_MAX_LOSS_USD to enable)")
         n = await self.gw.cancel_all()          # start-up hygiene: clear leftovers from earlier runs
         log.info("startup: equity=%.2f position=%.6f, cleared %d stale orders",
                  self.pos.account_value, self.pos.size, n)
         self._jlog("startup", equity=self.pos.account_value, position=self.pos.size,
-                   cleared_orders=n, env=os.environ.get("HL_ENV"), coin=self.p.coin)
+                   cleared_orders=n, env=os.environ.get("HL_ENV"), coin=self.p.coin,
+                   loss_guard=self.loss_guard is not None)
+        if self.loss_guard is not None:
+            self._jlog("loss_guard", enabled=True,
+                       start_equity=self.pos.account_value,
+                       soft_loss_usd=self.loss_cfg.soft_loss_usd,
+                       hard_loss_usd=self.loss_cfg.hard_loss_usd,
+                       halt_path=self.loss_guard.halt_path)
 
     # ---- events ------------------------------------------------------------------
     async def handle_event(self, ev) -> None:
@@ -238,6 +320,11 @@ class Bot:
             self._last_book_t = self.now()           # T7c observability
             self.metrics["book"] += 1
             self._flush_markouts()
+            # Hard-loss guard reacts on every book tick, so the stop does not
+            # wait for the next 5 s account poll.
+            if self.loss_guard is not None:
+                self._guard_action = self.loss_guard.evaluate(
+                    ev.market.mid, self.pos.size)
         elif isinstance(ev, FillEvent):
             if ev.is_snapshot:
                 return
@@ -295,6 +382,9 @@ class Bot:
     async def maybe_cycle(self) -> None:
         if self.halted or self.market is None:
             return
+        if self._guard_action in (GuardAction.HARD, GuardAction.PULL):
+            await self.cycle()               # risk action must not wait for the requote interval
+            return
         gap = self.now() - self._last_cycle
         if gap < self.p.min_requote_interval_s:
             # Toxicity transition gets the fast path, but never more often than
@@ -315,6 +405,20 @@ class Bot:
             if reason:
                 await self._kill_locked(reason)
                 return
+            # Independent hard-loss guard: HARD -> cancel + taker flatten + HALT,
+            # PULL -> cancel resting quotes, SOFT -> reducing side only.
+            if self.loss_guard is not None:
+                self._guard_action = self.loss_guard.evaluate(
+                    self.market.mid, self.pos.size)
+            if self._guard_action is GuardAction.HARD:
+                await self._hard_stop_locked()
+                return
+            if self._guard_action is GuardAction.PULL:
+                await self._pull_quotes_locked(now)
+                return
+            self._soft_only = self._guard_action is GuardAction.SOFT
+            if not self._soft_only:
+                self._pulled = False
             age = self.gw.feed_age_s()
             thr = self._stale_threshold_s()          # T7e: K x rolling-median cadence (legacy fallback)
             if age > thr:                            # T7b: confirm via ONE REST l2 snapshot per episode
@@ -353,11 +457,15 @@ class Bot:
                 await self._cycle_batched(now, age, inv0)
                 return
             targets = compute_quotes(self.market, self.pos.size, self.p, self.gw.spec, self.micro)
+            if self._soft_only:
+                targets = self._reduce_only(targets)
             blocked = frozenset(s for s, t in self._blocked_until.items() if t > now)
             plan = self.om.plan(targets, now, blocked)
             await self._apply_plan(plan, now, age)
             if abs(self.pos.size - inv0) > 1e-12:    # a fill landed during the RESTs:
                 targets = compute_quotes(self.market, self.pos.size, self.p, self.gw.spec, self.micro)
+                if self._soft_only:
+                    targets = self._reduce_only(targets)
                 plan = self.om.plan(targets, now, blocked)          # re-read sizing/inventory
                 await self._apply_plan(plan, now, age)
 
@@ -390,8 +498,23 @@ class Bot:
         # just above 2 x base (e.g. 0.32 vs 0.3217): the cap must bind at 2
         # fills, not 3.
         tol = 1.0001
-        return {"buy": base if (self.pos.size + base) <= max_sz * tol else 0.0,
-                "sell": base if (self.pos.size - base) >= -max_sz * tol else 0.0}
+        sizes = {"buy": base if (self.pos.size + base) <= max_sz * tol else 0.0,
+                 "sell": base if (self.pos.size - base) >= -max_sz * tol else 0.0}
+        if self._soft_only:
+            # SOFT stop: never add risk, only quote the side that reduces.
+            if self.pos.size >= 0:
+                sizes["buy"] = 0.0
+            if self.pos.size <= 0:
+                sizes["sell"] = 0.0
+        return sizes
+
+    def _reduce_only(self, quotes: list) -> list:
+        """Keep only quotes that reduce current inventory (SOFT stop, legacy path)."""
+        if self.pos.size > 0:
+            return [q for q in quotes if q.side is Side.SELL]
+        if self.pos.size < 0:
+            return [q for q in quotes if q.side is Side.BUY]
+        return []
 
     def _quote_ref(self, ref: float) -> float:
         """Reservation price with inventory skew applied (batch path).
@@ -970,6 +1093,13 @@ class Bot:
                         self._pending_poll_size = None       # agrees with local: streak reset
                         self.pos = st
                     self.guard.update_equity(st.account_value)
+                    if self.loss_guard is not None:
+                        # Same equity source as RiskGuard, so the two stops agree.
+                        mid = self.market.mid if self.market is not None else None
+                        if mid is not None:
+                            self.loss_guard.on_poll(st.account_value, self.pos.size, mid)
+                        self._guard_action = self.loss_guard.evaluate(
+                            mid, self.pos.size)
                     self._jlog("equity", equity=st.account_value, position=st.size,
                                entry_px=st.entry_px, unrealized_pnl=st.unrealized_pnl,
                                margin_used=st.margin_used, rtt_ms=round(rtt_ms, 3),
@@ -981,6 +1111,17 @@ class Bot:
             except Exception:
                 log.exception("account poll failed")
                 self.guard.record_error()
+        # Hard-loss guard: act here as well as in cycle(), so a dead book feed
+        # cannot starve the stop (staleness escalates without any book events).
+        if self.loss_guard is not None and not self.halted:
+            if self._guard_action is GuardAction.HARD:
+                async with self._lock:
+                    await self._hard_stop_locked()
+                return
+            if self._guard_action is GuardAction.PULL:
+                async with self._lock:
+                    if not self.halted:
+                        await self._pull_quotes_locked(self.now())
         # Dead-feed-safe kill check: enforce the account-loss stop even when no
         # fresh book event is arriving (cycle() may be starved by a dead feed).
         if not self.halted:
@@ -1033,16 +1174,24 @@ class Bot:
         lat_ema = g.lat_ema_ms if g else 0.0
         equity = g.equity if g else self.pos.account_value
         rss_peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # Linux: KiB -> MiB
+        lg = self.loss_guard
+        lg_mid = self.market.mid if self.market is not None else None
+        lg_est = (lg.estimated_equity(lg_mid)
+                  if (lg is not None and lg_mid is not None) else None)
+        lg_loss = (lg.e0 - lg_est) if (lg is not None and lg_est is not None) else 0.0
+        lg_action = self._guard_action.value if lg is not None else "off"
         return ("metrics book=%d fills=%d places=%d modifies=%d cancels=%d "
                 "cross_rejects=%d risk_rejects=%d other_rejects=%d place_errors=%d "
                 "modify_errors=%d parks=%d park_fallbacks=%d stale_pulls=%d feed_restarts=%d pos_drift=%d "
                 "orphans_cancelled=%d stale_pruned=%d veto_purges=%d actions_min=%d lat_ema_ms=%.0f "
-                "pos=%.6f equity=%.2f rss_peak_mb=%.0f feed_age=%.2f") % (
+                "pos=%.6f equity=%.2f rss_peak_mb=%.0f feed_age=%.2f "
+                "guard=%s guard_loss=%.3f hard_stops=%d guard_pulls=%d") % (
             m["book"], m["fills"], m["places"], m["modifies"], m["cancels"],
             m["cross_rejects"], m["risk_rejects"], m["other_rejects"], m["place_errors"],
             m["modify_errors"], m["parks"], m["park_fallbacks"], m["stale_pulls"], m["feed_restarts"],
             m["pos_drift"], m["orphans_cancelled"], m["stale_pruned"], m["veto_purges"], actions, lat_ema,
-            self.pos.size, equity, rss_peak_mb, self.gw.feed_age_s())
+            self.pos.size, equity, rss_peak_mb, self.gw.feed_age_s(),
+            lg_action, lg_loss, m["hard_stops"], m["guard_pulls"])
 
     def emit_metrics(self) -> None:
         log.info(self.metrics_line())
@@ -1115,6 +1264,70 @@ class Bot:
             self.guard.record_error()
 
     # ---- shutdown / kill ----------------------------------------------------------------
+    async def _pull_quotes_locked(self, now: float) -> None:
+        """PULL: equity is stale/unreadable, so stop quoting blind.
+
+        Cancels once per episode; ``_pulled`` is cleared when the guard returns
+        OK/SOFT again.
+        """
+        if self._pulled:
+            return
+        self._pulled = True
+        resting = [o for o in self.om.active() if o.status is OrderStatus.RESTING]
+        self.metrics["guard_pulls"] += 1
+        log.warning("LOSS GUARD PULL: equity estimate stale/unreadable; "
+                    "cancelling %d resting quote(s) pos=%.6f",
+                    len(resting), self.pos.size)
+        self._jlog("loss_guard_pull", orders=len(resting), pos=self.pos.size)
+        await self._do_cancels(resting, now)
+
+    async def _hard_stop_locked(self) -> None:
+        """HARD: cancel all, taker-flatten ladder, verify, write HALT, exit 3/4.
+
+        Caller must hold ``self._lock`` (or be the only writer).  Idempotent.
+        """
+        if self.halted:
+            return
+        self.halted = True
+        self.kill_reason = KillReason.MAX_ACCOUNT_LOSS
+        self.metrics["hard_stops"] += 1
+        g = self.loss_guard
+        mid = self.market.mid if self.market is not None else None
+        est = g.estimated_equity(mid) if (g is not None and mid is not None) else None
+        log.critical("LOSS GUARD HARD STOP: start=%.5f est=%s pos=%.6f mid=%s halt=%s",
+                     g.e0 if g else 0.0,
+                     f"{est:.5f}" if est is not None else "n/a",
+                     self.pos.size, mid, g.halt_path if g else None)
+        self._jlog("hard_stop", start_equity=(g.e0 if g else None),
+                   est_equity=est, position=self.pos.size, mid=mid,
+                   halt_path=(g.halt_path if g else None))
+
+        def _glog(msg: str) -> None:
+            (log.critical if "CRITICAL" in msg else log.warning)("hard_stop: %s", msg)
+
+        try:
+            res = await hard_stop_sequence(_LossGuardGateway(self.gw),
+                                           g.halt_path if g else None, _glog)
+            self._hard_exit_code = res.exit_code
+            flat, attempts = res.flat, res.attempts
+        except Exception:
+            # Fail closed: never leave the process running after a HARD decision.
+            log.exception("hard_stop_sequence crashed")
+            self._hard_exit_code = 4
+            flat, attempts = False, 0
+            try:
+                if g is not None and g.halt_path:
+                    with open(g.halt_path, "w") as fh:
+                        fh.write("hard stop\n")
+            except OSError as e:
+                log.critical("could not write HALT marker: %r", e)
+        finally:
+            log.critical("LOSS GUARD HARD STOP complete: flat=%s attempts=%d exit=%d",
+                         flat, attempts, self._hard_exit_code)
+            self._jlog("hard_stop_done", flat=flat, attempts=attempts,
+                       exit_code=self._hard_exit_code)
+            self.stop_event.set()
+
     async def _shutdown_actions(self, flatten: bool) -> None:
         for _ in range(3):
             try:
@@ -1185,6 +1398,8 @@ class Bot:
                 await self._shutdown_actions(flatten=self.flatten_on_exit)
         await self.gw.stop()
         log.info("stopped. metrics=%s", dict(self.metrics))
+        if self._hard_exit_code is not None:
+            return self._hard_exit_code
         return 2 if self.halted else 0
 
 

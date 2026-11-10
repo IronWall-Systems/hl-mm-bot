@@ -70,6 +70,7 @@ for _uid in sorted(AUTH_USER_IDS):
 HEARTBEAT_S = 1800
 INIT_RETRY_MIN_S = 15.0
 INIT_RETRY_MAX_S = 900.0
+AI_DIGEST_REFRESH_S = 300.0
 API = f"https://api.telegram.org/bot{TOKEN}"
 JSONL = status.JSONL
 CONSOLE = status.CONSOLE
@@ -88,6 +89,39 @@ PANEL_MESSAGE_IDS: Dict[int, Optional[int]] = {}
 if _ENV_PANEL.isdigit() and CHAT_IDS:
     PANEL_MESSAGE_IDS[CHAT_IDS[0]] = int(_ENV_PANEL)
 LAST_PANEL_REVIEW_TS = 0.0
+_LAST_DIGEST_REFRESH = 0.0
+
+
+def _ai_stamp(ai: Optional[Dict[str, Any]]) -> float:
+    """Newest timestamp the panel should react to (review or digest check)."""
+    if not ai:
+        return 0.0
+    return max(float(ai.get("ts") or 0.0), float(ai.get("check_ts") or 0.0))
+
+
+def refresh_ai_digest(force: bool = False) -> None:
+    """Refresh the deterministic sentinel digest, never invoking the AI.
+
+    The optional sentinel daemon is not always running; without this the panel
+    freezes at the last review timestamp.  ``--digest-only`` is read-only and
+    cannot take defensive action, so it is safe to call from the monitor.
+    """
+    global _LAST_DIGEST_REFRESH
+    now = time.time()
+    if not force and now - _LAST_DIGEST_REFRESH < AI_DIGEST_REFRESH_S:
+        return
+    _LAST_DIGEST_REFRESH = now
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT / "src")
+    try:
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "ai_sentinel.py"),
+             "--digest-only"],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60,
+        )
+    except Exception as exc:
+        print(f"[tg] digest refresh failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
 
 
 def _api(method: str, payload: Optional[Dict[str, Any]] = None,
@@ -151,7 +185,7 @@ def _run_ai_review(chat_id: int, panel_message_id: Optional[int]) -> None:
         print(f"[tg] ai_review failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     ai = status.read_ai_review()
     if ai:
-        LAST_PANEL_REVIEW_TS = ai["ts"]
+        LAST_PANEL_REVIEW_TS = _ai_stamp(ai)
     target = (panel_message_id if panel_message_id is not None
               else PANEL_MESSAGE_IDS.get(chat_id))
     if target is not None:
@@ -204,11 +238,16 @@ class Tailer(threading.Thread):
         if now - self.last_belt_alert < 300:
             return
         start = self._start_equity()
-        stop = start - status.HARD_STOP_USD
+        g = status.latest_guard()
+        start = float(g.get("start") or start)
+        hard = float(g.get("hard") or status.HARD_STOP_USD)
+        stop = start - hard
         self.last_belt_alert = now
         send_alert("SAFETY BELT / HARD STOP",
-                   f"Equity ${equity:.5f} is at/below the ${stop:.5f} hard stop "
-                   f"(start ${start:.5f}, loss ${start - equity:.5f}).")
+                   f"Equity {status.fmt_usd(equity, 5)} is at/below the "
+                   f"{status.fmt_usd(stop, 5)} hard stop "
+                   f"(start {status.fmt_usd(start, 5)}, "
+                   f"loss {status.fmt_usd(start - equity, 2)}).")
 
     def run(self) -> None:
         while True:
@@ -221,8 +260,10 @@ class Tailer(threading.Thread):
                         continue
                     kind = e.get("event")
                     if kind == "fill":
+                        fee = float(e.get("fee") or 0.0)
                         send_alert("FILL", f"{e.get('side')} {e.get('size')} @ {e.get('px')} "
-                                           f"· fee ${float(e.get('fee') or 0):.5f} · pos {e.get('pos')}")
+                                           f"· fee {status.fmt_usd(-fee, 4, signed=True)} "
+                                           f"· pos {e.get('pos')}")
                     elif kind == "park":
                         send_alert("EMERGENCY OTM PARK",
                                    f"{e.get('side')} parked to {e.get('price')} × {e.get('size')} "
@@ -303,12 +344,15 @@ def main() -> None:
     print(f"[tg] connected as @{me['result'].get('username')}", flush=True)
 
     Tailer().start()
+    # Make the first panel show a current deterministic digest timestamp even
+    # when the optional sentinel daemon is not running.
+    refresh_ai_digest(force=True)
     sent = send_status_all()
     print(f"[tg] initial status sent to "
           f"{ {cid: mid for cid, mid in sent.items() if mid is not None} }", flush=True)
     ai0 = status.read_ai_review()
     if ai0:
-        LAST_PANEL_REVIEW_TS = ai0["ts"]
+        LAST_PANEL_REVIEW_TS = _ai_stamp(ai0)
     last_heartbeat = time.time()
     # Per-chat retry schedule for operators who have not pressed Start yet.
     init_retry_at = {cid: time.time() + INIT_RETRY_MIN_S
@@ -325,11 +369,12 @@ def main() -> None:
             for upd in (data or {}).get("result", []):
                 offset = max(offset, int(upd["update_id"]) + 1)
                 handle_update(upd)
-            # Pick up scheduled/anomaly reviews written by the sentinel daemon
-            # and fold them into every existing panel (never a new chat message).
+            # Keep the deterministic digest current (throttled, AI-free), then
+            # pick up scheduled/anomaly reviews and fold them into every panel.
+            refresh_ai_digest()
             ai = status.read_ai_review()
-            if ai and ai["ts"] > LAST_PANEL_REVIEW_TS:
-                LAST_PANEL_REVIEW_TS = ai["ts"]
+            if ai and _ai_stamp(ai) > LAST_PANEL_REVIEW_TS:
+                LAST_PANEL_REVIEW_TS = _ai_stamp(ai)
                 for chat_id, mid in list(PANEL_MESSAGE_IDS.items()):
                     if mid is not None:
                         send_status(chat_id, edit_message_id=mid)
@@ -355,7 +400,11 @@ def main() -> None:
                     init_retry_delay[chat_id] = delay
                     init_retry_at[chat_id] = now + delay
             if time.time() - last_heartbeat >= HEARTBEAT_S:
+                refresh_ai_digest(force=True)
                 send_status_all()
+                ai = status.read_ai_review()
+                if ai:
+                    LAST_PANEL_REVIEW_TS = _ai_stamp(ai)
                 last_heartbeat = time.time()
         except KeyboardInterrupt:
             break

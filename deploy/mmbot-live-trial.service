@@ -13,10 +13,17 @@ WorkingDirectory=/root/hl-mm-bot-live-safety-trial
 Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+# Durable hard-stop marker (logs/ is the unit's only writable path).
+Environment=RISK_HALT_FILE=/root/hl-mm-bot-live-safety-trial/logs/HALT
+# Refuse to start while a hard-stop HALT marker exists.  Requires an operator
+# to inspect the flatten result and remove the file deliberately.
+ExecStartPre=/usr/bin/test ! -e /root/hl-mm-bot-live-safety-trial/logs/HALT
 ExecStart=/root/hl-mm-bot/venv/bin/python scripts/live_trial_20261107.py
 # A kill-switch halt must stay halted until an operator decides. Auto-restart
 # would fight the risk guard and the exchange request budget.
 Restart=no
+# Belt-and-suspenders if Restart is ever changed to on-failure.
+RestartPreventExitStatus=2 3 4
 TimeoutStopSec=30
 KillSignal=SIGTERM
 LimitNOFILE=65536

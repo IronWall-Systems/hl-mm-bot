@@ -52,3 +52,60 @@ superseded by this logged change).
   minutes.
 * Observed `batchModify` p50 `400.1 ms`, p95 `444.6 ms`; `Alo` bulk place
   `426.9 ms`.
+
+## Run 3 — protocol amendment: 30-fill halt rule waived (2026-11-10)
+
+* **Amendment ID:** `AMD-20261110-01`
+* **Logged:** `2026-11-10 20:01 UTC` (live session started `2026-11-10 10:04:04 UTC`)
+* **Authority:** explicit operator instruction in-session.
+
+### Trigger
+
+The pre-registered rule — *halt after 30 fills if average net PnL per fill is
+negative* — was satisfied and not acted on at the time:
+
+| Fill # | Time (UTC) | Cumulative net | Avg net/fill |
+|--------|-----------|----------------|--------------|
+| 30 | 15:40:52 | **−$0.1063** | **−$0.00354** |
+| 40 | 15:56:52 | −$0.0379 | −$0.00095 |
+| 50 | 17:38:12 | **+$0.0378** | **+$0.00076** |
+
+The 6-hour window (10:04→16:04 UTC) closed with **40 fills, net −$0.0379**
+(gross +$0.0267, fees $0.0646). The manual halt that the rule called for at
+~15:40 UTC did not occur. This entry records that fact rather than papering
+over it.
+
+### Decision
+
+The operator **waives the manual 30-fill halt rule** for this run. Rationale:
+`loss_guard` is active and strictly enforces the **−$0.50 soft / −$0.80 hard**
+account-equity floor on every book tick, so the equity stop — not the fill
+count — is the binding control. The trial continues under `loss_guard` plus the
+**72-hour** time limit.
+
+### Scope — what is *not* waived
+
+* Soft `−$0.50` / hard `−$0.80` thresholds and all `loss_guard` behaviour
+  (SOFT reduce-only, PULL cancel, HARD cancel→flatten→HALT→exit 3/4) unchanged.
+* No parameter changes; the frozen trial parameters remain in force.
+* The 72-hour time limit remains.
+* `Restart=no`, `RestartPreventExitStatus=2 3 4`, and the `ExecStartPre` HALT
+  check remain.
+* Future fills are not exempt from scrutiny: a *new* negative stretch should be
+  reviewed on its own merits, not covered by this waiver.
+
+### State at logging
+
+* Service untouched: `mmbot-live-trial.service`, PID `111775`, same process
+  since `10:04:04 UTC`, `NRestarts=0`, uptime ~10 h. No restart performed to
+  record this amendment.
+* Equity `$21.13877`; net vs baseline `$21.018501` = **+$0.1203**.
+* Realized (avg-cost, net of fees) **+$0.1181** over **54 fills**
+  (avg **+$0.00219**/fill); unrealized **+$0.00225**; position `−0.010000` HYPE.
+* `guard=ok`, `guard_loss=−0.119`, `hard_stops=0`, `guard_pulls=0`; no HALT.
+
+### Caveat
+
+`loss_guard` bounds *account equity* at the poll/book cadence; it is not a
+guarantee of a $1.00 maximum loss. A gap through the stop can still slip past
+the −$0.80 floor. This waiver accepts that residual risk knowingly.

@@ -1,0 +1,54 @@
+[Unit]
+Description=mmbot rolling-buffer online learning (Testnet + Shadow Paper, no credentials)
+Documentation=file:///root/hl-mm-bot-live-safety-trial/scripts/rolling_learning_daemon.py
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/hl-mm-bot-live-safety-trial
+Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Shadow-only learning.  No API key, no .env, no authenticated call: the feed
+# is the public testnet l2Book endpoint and fills are simulated locally.
+Environment=MM_LEARNING=1
+Environment=MM_REWARD_CAP_USD=0.10
+# Durable hard-stop marker shared with the live service.
+Environment=RISK_HALT_FILE=/root/hl-mm-bot-live-safety-trial/logs/HALT
+ExecStart=/root/hl-mm-bot/venv/bin/python scripts/rolling_learning_daemon.py \
+    --env testnet \
+    --source l2 \
+    --coin HYPE \
+    --poll-s 2 \
+    --retention-h 24 \
+    --max-retention-h 168 \
+    --train-every-s 14400 \
+    --min-steps 200 \
+    --min-new-steps 100
+# A shadow guard HARD exit (3) is a deliberate stop, not a crash: do not fight
+# it with an automatic restart.  Transient network failures are handled inside
+# the daemon (synthetic fallback), so only real faults restart.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/hl-mm-bot-live-safety-trial/data
+ReadWritePaths=/root/hl-mm-bot-live-safety-trial/models
+ReadWritePaths=/root/hl-mm-bot-live-safety-trial/logs
+StandardOutput=append:/root/hl-mm-bot-live-safety-trial/logs/rolling_learning.console.log
+StandardError=append:/root/hl-mm-bot-live-safety-trial/logs/rolling_learning.console.log
+
+[Install]
+WantedBy=multi-user.target

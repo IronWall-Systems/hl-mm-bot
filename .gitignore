@@ -9,6 +9,7 @@ id_rsa*
 # ---- runtime market data / logs (never commit) ----
 data/
 logs/
+models/
 *.jsonl
 *.jsonl.gz
 collector_pid.txt

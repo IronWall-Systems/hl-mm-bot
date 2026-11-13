@@ -34,9 +34,18 @@ for candidate in (ROOT / ".env", Path("/root/hl-mm-bot/.env")):
         load_dotenv(candidate, override=False)
 
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
 import status_live_trial as status  # noqa: E402
+from mmbot.learning.keys import InMemoryKeyVault, parse_key_command  # noqa: E402
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# Development-only convenience: accept provider keys in chat, delete the raw
+# message immediately, and keep the key in process memory only.  Off by
+# default; never enable this on a production account.
+ALLOW_KEY_INGEST = os.environ.get("TG_ALLOW_KEY_INGEST", "0").lower() in (
+    "1", "true", "yes", "on")
+KEY_VAULT = InMemoryKeyVault(ttl_s=float(os.environ.get("TG_KEY_TTL_S", "3600")))
 
 
 def _parse_ids(raw: str) -> list:
@@ -294,6 +303,49 @@ def _authorized(user_id: Any) -> bool:
         return False
 
 
+def _handle_key_message(msg: Dict[str, Any], chat_id: int, raw_text: str) -> bool:
+    """Dev-mode key ingestion: read -> delete the raw message -> store in RAM.
+
+    The raw key is never written to disk, never echoed back and never logged.
+    Returns True when the update was a key and has been handled.
+    """
+    if not ALLOW_KEY_INGEST:
+        return False
+    parsed = parse_key_command(raw_text)
+    if parsed is None:
+        return False
+    provider, key = parsed
+    # Delete immediately after reading into memory, before anything else can
+    # persist it.  This removes the message from both sides of the chat.
+    mid = msg.get("message_id")
+    deleted = True
+    if mid is not None:
+        resp = _api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+        deleted = bool(resp and resp.get("ok"))
+    if not deleted:
+        # Never keep a secret whose raw message is still visible in the chat.
+        _api("sendMessage", {
+            "chat_id": chat_id,
+            "text": ("⚠️ Could not delete the key message; <b>not ingested</b>. "
+                     "Delete it manually and retry."),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        })
+        print("[tg] key ingest refused: deleteMessage failed", flush=True)
+        return True
+    KEY_VAULT.put(provider, key)
+    _api("sendMessage", {
+        "chat_id": chat_id,
+        "text": (f"🔐 <b>{provider}</b> key ingested; the raw message was "
+                 f"deleted. In-memory only (TTL {int(KEY_VAULT.ttl_s)}s)."),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
+    print(f"[tg] dev key ingested provider={provider} (message deleted; memory only)",
+          flush=True)
+    return True
+
+
 def handle_update(upd: Dict[str, Any]) -> bool:
     msg = upd.get("message")
     if msg:
@@ -302,7 +354,10 @@ def handle_update(upd: Dict[str, Any]) -> bool:
         chat_id = int((msg.get("chat") or {}).get("id") or 0)
         if not chat_id:
             return False
-        text = (msg.get("text") or "").strip().lower()
+        raw_text = msg.get("text") or ""
+        if _handle_key_message(msg, chat_id, raw_text):
+            return True
+        text = raw_text.strip().lower()
         if text.startswith("/start") or text.startswith("/status"):
             return send_status(chat_id,
                                edit_message_id=PANEL_MESSAGE_IDS.get(chat_id)) is not None

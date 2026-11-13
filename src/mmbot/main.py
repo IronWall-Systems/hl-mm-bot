@@ -158,6 +158,11 @@ class Bot:
         self._soft_only = False          # SOFT: quote only the reducing side
         self._pulled = False             # PULL: resting quotes already cancelled
         self._hard_exit_code: Optional[int] = None
+        # Rolling online learning (opt-in, observational).  Training runs in a
+        # separate process so a checkpoint write never blocks quoting.
+        self._learning_enabled = os.environ.get("MM_LEARNING", "0").lower() in (
+            "1", "true", "yes", "on")
+        self.learning = None
         self.halted = False
         self.kill_reason: Optional[KillReason] = None
         self.stop_event = asyncio.Event()
@@ -259,6 +264,48 @@ class Bot:
                 keep.append(m)
         self._markouts = keep
 
+    # ---- rolling learning (observational) ---------------------------------
+    def _learning_action_hint(self) -> str:
+        if self._guard_action is GuardAction.SOFT:
+            return "reduce_only"
+        if self._guard_action is GuardAction.PULL or self._stale_state == "stale":
+            return "pull"
+        return "quote_both"
+
+    @staticmethod
+    def _action_from_sides(buy: bool, sell: bool, soft_only: bool = False) -> str:
+        if soft_only:
+            return "reduce_only"
+        if buy and sell:
+            return "quote_both"
+        if buy:
+            return "quote_bid"
+        if sell:
+            return "quote_ask"
+        return "pull"
+
+    def _learning_observe(self, now: float, action_hint: Optional[str] = None) -> None:
+        """Record one decision step.  Never raises into the trading loop.
+
+        The learning layer uses wall-clock timestamps (the buffer's retention
+        window is wall-clock); ``now`` here is the bot's monotonic clock and is
+        intentionally not reused.
+        """
+        if self.learning is None or self.market is None:
+            return
+        try:
+            mid = self.market.mid
+            if mid <= 0:
+                return
+            self.learning.observe(
+                time.time(), mid, micro=self.micro,
+                position=self.pos.size, equity=self.pos.account_value,
+                guard_status=self._guard_action.value,
+                action_hint=action_hint or self._learning_action_hint(),
+                spread_bps=self.market.spread_bps)
+        except Exception:
+            log.exception("learning observe failed (trading continues)")
+
     # ---- startup ---------------------------------------------------------------
     async def init(self) -> None:
         await self.gw.start()
@@ -280,6 +327,18 @@ class Bot:
                         self.pos.account_value)
         else:
             log.info("loss guard disabled (set RISK_LOSS_GUARD=1 or RISK_MAX_LOSS_USD to enable)")
+        if self._learning_enabled:
+            try:
+                from .learning.recorder import LearningRecorder
+                self.learning = LearningRecorder.from_env(
+                    coin=self.p.coin, max_notional=self.p.max_notional)
+                if self.learning is not None:
+                    log.warning("LEARNING RECORDER ENABLED: buffer=%s steps=%d policy=%s",
+                                self.learning.buffer.path, len(self.learning.buffer),
+                                self.learning.policy_path)
+            except Exception:
+                log.exception("learning recorder init failed (trading continues)")
+                self.learning = None
         n = await self.gw.cancel_all()          # start-up hygiene: clear leftovers from earlier runs
         log.info("startup: equity=%.2f position=%.6f, cleared %d stale orders",
                  self.pos.account_value, self.pos.size, n)
@@ -325,6 +384,11 @@ class Bot:
             if self.loss_guard is not None:
                 self._guard_action = self.loss_guard.evaluate(
                     ev.market.mid, self.pos.size)
+            if self.learning is not None:
+                try:
+                    self.learning.on_mark(time.time(), ev.market.mid)
+                except Exception:
+                    log.exception("learning mark failed (trading continues)")
         elif isinstance(ev, FillEvent):
             if ev.is_snapshot:
                 return
@@ -343,6 +407,12 @@ class Bot:
             self._jlog("fill", side=ev.side.value, px=ev.px, size=ev.sz, fee=ev.fee,
                        oid=ev.oid, cloid=ev.cloid, pos=self.pos.size)
             self._track_markout(ev.side, ev.px, ev.sz, self.pos.size)
+            if self.learning is not None:
+                try:
+                    self.learning.on_fill(time.time(), ev.side.value,
+                                          ev.px, ev.sz, ev.fee)
+                except Exception:
+                    log.exception("learning fill failed (trading continues)")
         elif isinstance(ev, OrderUpdateEvent):
             self.om.on_order_update(ev, self.now())
         elif isinstance(ev, FeedDownEvent):
@@ -411,9 +481,11 @@ class Bot:
                 self._guard_action = self.loss_guard.evaluate(
                     self.market.mid, self.pos.size)
             if self._guard_action is GuardAction.HARD:
+                self._learning_observe(now, "risk_hold")
                 await self._hard_stop_locked()
                 return
             if self._guard_action is GuardAction.PULL:
+                self._learning_observe(now, "pull")
                 await self._pull_quotes_locked(now)
                 return
             self._soft_only = self._guard_action is GuardAction.SOFT
@@ -444,6 +516,7 @@ class Bot:
                         self.metrics["stale_pulls"] += 1
                         await self._do_cancels([o for o in self.om.active()
                                                 if o.status is OrderStatus.RESTING], now)
+                        self._learning_observe(now, "pull")
                         return                       # T7e: REST confirm NEVER restarts feeds
                 elif self._stale_state == "quiet":
                     age = 0.0                        # already confirmed this episode
@@ -459,6 +532,9 @@ class Bot:
             targets = compute_quotes(self.market, self.pos.size, self.p, self.gw.spec, self.micro)
             if self._soft_only:
                 targets = self._reduce_only(targets)
+            sides = {q.side for q in targets}
+            self._learning_observe(now, self._action_from_sides(
+                Side.BUY in sides, Side.SELL in sides, self._soft_only))
             blocked = frozenset(s for s, t in self._blocked_until.items() if t > now)
             plan = self.om.plan(targets, now, blocked)
             await self._apply_plan(plan, now, age)
@@ -549,8 +625,13 @@ class Bot:
         # signal, which fired bilateral pull-park 1 s after placement).
         tox = self._tox.current()
         tox_sides = frozenset(s.value for s in tox)
+        sizes = self._tgt_sizes(ref)
+        self._learning_observe(now, self._action_from_sides(
+            sizes.get("buy", 0.0) > 0 and "buy" not in tox_sides,
+            sizes.get("sell", 0.0) > 0 and "sell" not in tox_sides,
+            self._soft_only))
         payloads = self.om.plan_batched(self.batch_planner, self._quote_ref(ref),
-                                        self._tgt_sizes(ref), now,
+                                        sizes, now,
                                         skip=self._skip_sides(now), toxic=tox_sides)
         await self._execute_batch_payloads(payloads, now, feed_age)
         if abs(self.pos.size - inv0) > 1e-12:      # a fill landed during the RESTs
@@ -1122,6 +1203,13 @@ class Bot:
                 async with self._lock:
                     if not self.halted:
                         await self._pull_quotes_locked(self.now())
+        if self.learning is not None:
+            try:
+                wall = time.time()
+                self.learning.settle(wall)
+                self.learning.maybe_trim(wall)
+            except Exception:
+                log.exception("learning settle/trim failed (trading continues)")
         # Dead-feed-safe kill check: enforce the account-loss stop even when no
         # fresh book event is arriving (cycle() may be starved by a dead feed).
         if not self.halted:

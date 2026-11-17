@@ -16,7 +16,7 @@ nk(){ date -u +%FT%TZ; }
 
 while true; do
     start=$(date +%s)
-    venv/bin/python scripts/paper_shadow.py --interval 300 >>"$log" 2>&1
+    nice -n 19 ionice -c 3 venv/bin/python scripts/paper_shadow.py --interval 300 >>"$log" 2>&1
     rc=$?
     ran=$(( $(date +%s) - start ))
     echo "[$(nk)] supervisor: paper_shadow exited rc=$rc after ${ran}s" >>"$log"

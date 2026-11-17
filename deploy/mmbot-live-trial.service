@@ -1,6 +1,6 @@
 [Unit]
 Description=HYPE live micro-notional trading trial
-Documentation=file:///root/hl-mm-bot-live-safety-trial/scripts/live_trial_20261107.py
+Documentation=file:///root/hl-mm-bot/scripts/live_trial_20261107.py
 After=network-online.target mmbot-microstructure.service
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -9,15 +9,15 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/hl-mm-bot-live-safety-trial
-Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+WorkingDirectory=/root/hl-mm-bot
+Environment=PYTHONPATH=/root/hl-mm-bot/src
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 # Durable hard-stop marker (logs/ is the unit's only writable path).
-Environment=RISK_HALT_FILE=/root/hl-mm-bot-live-safety-trial/logs/HALT
+Environment=RISK_HALT_FILE=/root/hl-mm-bot/logs/HALT
 # Refuse to start while a hard-stop HALT marker exists.  Requires an operator
 # to inspect the flatten result and remove the file deliberately.
-ExecStartPre=/usr/bin/test ! -e /root/hl-mm-bot-live-safety-trial/logs/HALT
+ExecStartPre=/usr/bin/test ! -e /root/hl-mm-bot/logs/HALT
 ExecStart=/root/hl-mm-bot/venv/bin/python scripts/live_trial_20261107.py
 # A kill-switch halt must stay halted until an operator decides. Auto-restart
 # would fight the risk guard and the exchange request budget.
@@ -33,9 +33,9 @@ TasksMax=64
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/root/hl-mm-bot-live-safety-trial/logs
-StandardOutput=append:/root/hl-mm-bot-live-safety-trial/logs/live_trial_20261107_hype.console.log
-StandardError=append:/root/hl-mm-bot-live-safety-trial/logs/live_trial_20261107_hype.console.log
+ReadWritePaths=/root/hl-mm-bot/logs
+StandardOutput=append:/root/hl-mm-bot/logs/live_trial_20261107_hype.console.log
+StandardError=append:/root/hl-mm-bot/logs/live_trial_20261107_hype.console.log
 
 [Install]
 WantedBy=multi-user.target

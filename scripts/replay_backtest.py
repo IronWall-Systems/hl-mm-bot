@@ -318,6 +318,10 @@ class ReplayEngine:
         min_requote_interval_s: float = 0.3,
         latency_ms: float = 500.0,
         feed_age_ms: float = 400.0,
+        feed_age_from_record: bool = True,
+        place_modify_latency_ms: float | None = None,
+        cancel_latency_ms: float | None = None,
+        park_via_modify: bool = False,
         cancel_rate: float = 0.0,
         maker_fee_bps: float = MAKER_FEE_BPS,
     ) -> None:
@@ -335,6 +339,21 @@ class ReplayEngine:
         )
         self.latency_s = latency_ms / 1000.0
         self.feed_age_s = feed_age_ms / 1000.0
+        # Collector-v2 records carry their own receive timestamp (r).  Useful for
+        # local feeds, but archive r-t includes the collector host path (~400 ms
+        # here), so warm-feed profiles must force the configured feed age.
+        self.feed_age_from_record = bool(feed_age_from_record)
+        # Split L1 timing.  ``latency_ms`` remains the backward-compatible
+        # fallback for both paths when the explicit values are not supplied.
+        self.place_modify_latency_s = (
+            latency_ms if place_modify_latency_ms is None else place_modify_latency_ms
+        ) / 1000.0
+        self.cancel_latency_s = (
+            latency_ms if cancel_latency_ms is None else cancel_latency_ms
+        ) / 1000.0
+        # When True, a risk-off pull is modelled as an OTM park via batchModify
+        # (fast path) instead of a raw bulk cancel (slow path).
+        self.park_via_modify = bool(park_via_modify)
         self.cancel_rate = cancel_rate
         self.maker_fee_bps = maker_fee_bps
 
@@ -445,6 +464,23 @@ class ReplayEngine:
         return self.mid_grid[max(keys)][1] if keys else self.last_mid
 
     # ------------------------------------------------------------- scheduling
+    def seen_time(self, t: float) -> float:
+        """Market timestamp as visible to the bot after feed transit."""
+        return t + self.current_feed_age_s
+
+    def place_ready_time(self, seen_t: float) -> float:
+        """When a fast-path place / batchModify becomes effective."""
+        return seen_t + self.place_modify_latency_s
+
+    def cancel_ready_time(self, seen_t: float) -> float:
+        """When a raw bulk cancel becomes effective (slow path)."""
+        return seen_t + self.cancel_latency_s
+
+    def park_ready_time(self, seen_t: float) -> float:
+        """When a risk-off quote pull becomes effective."""
+        delay = self.place_modify_latency_s if self.park_via_modify else self.cancel_latency_s
+        return seen_t + delay
+
     def _schedule(self, eff: float, kind: str, payload: object) -> None:
         self._seq += 1
         if kind == "place":
@@ -517,7 +553,7 @@ class ReplayEngine:
         t = t_ms / 1000.0
         self.exch_ts = t
         recv = rec.get("r")
-        if isinstance(recv, (int, float)):
+        if self.feed_age_from_record and isinstance(recv, (int, float)):
             age_ms = float(recv) - float(t_ms)  # both epoch ms (collector v2)
             if age_ms < 0:
                 age_ms = 0.0
@@ -701,7 +737,8 @@ class ReplayEngine:
         self.last_decision_seen = seen_t
         self.stats.decisions += 1
         targets = {q.side.value: q for q in compute_quotes(m, self.pos, self.params, self.spec)}
-        eff = seen_t + self.latency_s
+        eff_place = self.place_ready_time(seen_t)
+        eff_park = self.park_ready_time(seen_t)
         for side in ("buy", "sell"):
             tgt = targets.get(side)
             w = self.working[side]
@@ -709,7 +746,7 @@ class ReplayEngine:
                 continue
             if tgt is None:
                 if w is not None or self.pending_place[side] is not None:
-                    self._schedule(eff, "cancel", side)
+                    self._schedule(eff_park, "cancel", side)
                 continue
             px = float(tgt.price)
             sz = float(tgt.size)
@@ -720,18 +757,19 @@ class ReplayEngine:
                 if in_flight is not None:
                     moved = abs(px - in_flight[0]) / in_flight[0] * 1e4
                     if moved >= self.params.requote_threshold_bps:
-                        self._schedule(eff, "cancel", side)
-                        self._schedule(eff, "place", (side, px, sz))
+                        # A requote is a batchModify in production: fast path.
+                        self._schedule(eff_place, "cancel", side)
+                        self._schedule(eff_place, "place", (side, px, sz))
                     continue
-                self._schedule(eff, "place", (side, px, sz))
+                self._schedule(eff_place, "place", (side, px, sz))
                 continue
             if self.pending_cancel[side]:
                 continue
             moved_bps = abs(px - w.px) / w.px * 1e4
             undersized = w.size < (1.0 - self.params.size_tolerance) * sz
             if moved_bps >= self.params.requote_threshold_bps or undersized:
-                self._schedule(eff, "cancel", side)
-                self._schedule(eff, "place", (side, px, sz))
+                self._schedule(eff_place, "cancel", side)
+                self._schedule(eff_place, "place", (side, px, sz))
 
     # --------------------------------------------------------------- results
     def compute_metrics(self, markouts: Iterable[float] = MARKOUT_S) -> dict:
@@ -848,9 +886,15 @@ MARKDOWN_ROWS = [
 
 
 def format_markdown(metrics: dict, args: argparse.Namespace) -> str:
+    _place = getattr(args, "place_modify_latency_ms", None)
+    _cancel = getattr(args, "cancel_latency_ms", None)
+    _place = getattr(args, "latency_ms", 0.0) if _place is None else _place
+    _cancel = _place if _cancel is None else _cancel
+    _park = getattr(args, "park_via_modify", False)
     lines = [
         f"## replay backtest — {metrics['coin']}  "
-        f"(latency {args.latency_ms:.0f} ms, hs {args.half_spread_bps} bps, "
+        f"(place/modify {_place:.0f} ms, cancel {_cancel:.0f} ms, "
+        f"park_via_modify={_park}, hs {args.half_spread_bps} bps, "
         f"skew {args.skew_bps} bps, cancel_rate {args.cancel_rate}, "
         f"feed_age {args.feed_age_ms:.0f} ms fixed)",
         "",
@@ -928,11 +972,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-tar", action="store_true",
                    help="do not auto-read data_YYYYMMDD.tar from --archive-dir")
     p.add_argument("--universe", default=str(PROJECT_ROOT / "data" / "universe.json"))
-    p.add_argument("--latency-ms", type=float, default=500.0)
+    p.add_argument("--latency-ms", type=float, default=500.0,
+                   help="backward-compatible fallback for both L1 paths")
+    p.add_argument("--place-modify-latency-ms", type=float, default=None,
+                   help="fast-path Alo place / batchModify latency; default = --latency-ms")
+    p.add_argument("--cancel-latency-ms", type=float, default=None,
+                   help="raw bulk-cancel latency; default = --latency-ms")
+    p.add_argument("--park-via-modify", action="store_true",
+                   help="model risk-off pulls as an OTM park via batchModify (fast path)")
     p.add_argument("--half-spread-bps", type=float, default=4.0)
     p.add_argument("--skew-bps", type=float, default=6.0)
     p.add_argument("--cancel-rate", type=float, default=0.0)
     p.add_argument("--feed-age-ms", type=float, default=400.0)
+    p.add_argument("--feed-age-source", choices=("recorded", "fixed"), default="recorded",
+                   help="use the record's r-t receive age, or force --feed-age-ms")
     p.add_argument("--quote-notional", type=float, default=15.0)
     p.add_argument("--max-notional", type=float, default=60.0)
     p.add_argument("--min-order-notional", type=float, default=10.0)
@@ -974,6 +1027,10 @@ def main(argv: list[str] | None = None) -> int:
         min_order_notional=args.min_order_notional,
         latency_ms=args.latency_ms,
         feed_age_ms=args.feed_age_ms,
+        feed_age_from_record=(args.feed_age_source == "recorded"),
+        place_modify_latency_ms=args.place_modify_latency_ms,
+        cancel_latency_ms=args.cancel_latency_ms,
+        park_via_modify=args.park_via_modify,
         cancel_rate=args.cancel_rate,
         maker_fee_bps=args.maker_fee_bps,
     )

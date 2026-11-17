@@ -1,6 +1,6 @@
 [Unit]
 Description=Read-only Telegram dashboard for the HYPE live trial
-Documentation=file:///root/hl-mm-bot-live-safety-trial/scripts/telegram_monitor.py
+Documentation=file:///root/hl-mm-bot/scripts/telegram_monitor.py
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -9,8 +9,8 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/hl-mm-bot-live-safety-trial
-Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+WorkingDirectory=/root/hl-mm-bot
+Environment=PYTHONPATH=/root/hl-mm-bot/src
 Environment=PYTHONUNBUFFERED=1
 Environment=TG_PANEL_MESSAGE_ID=46
 ExecStart=/root/hl-mm-bot/venv/bin/python scripts/telegram_monitor.py
@@ -25,9 +25,9 @@ TasksMax=32
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/root/hl-mm-bot-live-safety-trial/logs
-StandardOutput=append:/root/hl-mm-bot-live-safety-trial/logs/telegram_monitor.console.log
-StandardError=append:/root/hl-mm-bot-live-safety-trial/logs/telegram_monitor.console.log
+ReadWritePaths=/root/hl-mm-bot/logs
+StandardOutput=append:/root/hl-mm-bot/logs/telegram_monitor.console.log
+StandardError=append:/root/hl-mm-bot/logs/telegram_monitor.console.log
 
 [Install]
 WantedBy=multi-user.target

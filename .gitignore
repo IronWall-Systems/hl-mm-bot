@@ -42,3 +42,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.log
+
+# ---- nested trial worktree (moved 2026-11-13) ----
+/live-safety-trial/

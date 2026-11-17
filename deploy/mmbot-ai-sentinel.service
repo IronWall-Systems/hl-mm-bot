@@ -1,6 +1,6 @@
 [Unit]
 Description=AI quant sentinel for the HYPE live trial
-Documentation=file:///root/hl-mm-bot-live-safety-trial/scripts/ai_sentinel.py
+Documentation=file:///root/hl-mm-bot/scripts/ai_sentinel.py
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -9,8 +9,8 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/hl-mm-bot-live-safety-trial
-Environment=PYTHONPATH=/root/hl-mm-bot-live-safety-trial/src
+WorkingDirectory=/root/hl-mm-bot
+Environment=PYTHONPATH=/root/hl-mm-bot/src
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/root/hl-mm-bot/venv/bin/python scripts/ai_sentinel.py

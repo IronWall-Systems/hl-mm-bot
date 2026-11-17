@@ -149,18 +149,19 @@ class SyntheticFeed:
     """Deterministic random-walk fallback (offline / network outage)."""
 
     def __init__(self, coin: str, start_mid: float = 100.0, seed: int = 7,
-                 vol_bps: float = 6.0):
+                 vol_bps: float = 6.0, spread_bps: float = 445.0):
         self.coin = coin
         self.mid = float(start_mid)
         self.btc = 60_000.0
         self.vol_bps = float(vol_bps)
+        self.spread_bps = float(spread_bps)
         self.rng = np.random.default_rng(seed)
         self._btc_hist: Deque[Tuple[float, float]] = deque(maxlen=600)
 
     def snapshot(self, now: float) -> Snapshot:
         self.mid *= math.exp(float(self.rng.normal(0, self.vol_bps / 1e4)))
         self.btc *= math.exp(float(self.rng.normal(0, self.vol_bps * 0.7 / 1e4)))
-        half = max(1e-4, self.mid * 2.0 / 1e4)
+        half = max(1e-4, self.mid * self.spread_bps / 2.0 / 1e4)
         bsz = float(max(0.01, abs(self.rng.normal(2.0, 0.5))))
         asz = float(max(0.01, abs(self.rng.normal(2.0, 0.5))))
         self._btc_hist.append((now, self.btc))
@@ -321,9 +322,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start-equity", type=float, default=21.0)
     p.add_argument("--max-notional", type=float, default=11.0)
     p.add_argument("--fee-bps", type=float, default=1.5)
-    p.add_argument("--edge-bps", type=float, default=1.0)
+    p.add_argument("--edge-bps", type=float, default=14.0,
+                   help="quote half-spread in bps (live-calibrated)")
     p.add_argument("--fill-prob", type=float, default=0.02,
                    help="per-poll fill probability for a quote inside the book")
+    p.add_argument("--spread-bps", type=float, default=445.0,
+                   help="testnet bid-ask spread in bps (synthetic feed)")
     p.add_argument("--soft-loss-usd", type=float, default=2.0)
     p.add_argument("--hard-loss-usd", type=float, default=5.0)
     p.add_argument("--kl-max", type=float, default=0.15)
@@ -400,14 +404,21 @@ def build(args):
 async def run(args) -> int:
     buffer, policy, recorder, trainer, guard, guard_state, loop = build(args)
     if args.source == "synthetic":
-        feed = SyntheticFeed(args.coin, start_mid=100.0, seed=args.seed)
+        feed = SyntheticFeed(args.coin, start_mid=100.0, seed=args.seed,
+                             spread_bps=args.spread_bps)
     else:
         feed = ResilientFeed(
             PublicL2Feed(args.env, args.coin),
-            SyntheticFeed(args.coin, start_mid=100.0, seed=args.seed))
+            SyntheticFeed(args.coin, start_mid=100.0, seed=args.seed,
+                          spread_bps=args.spread_bps))
     broker = PaperBroker(args.start_equity, args.max_notional,
                          fee_bps=args.fee_bps, edge_bps=args.edge_bps,
                          fill_prob=args.fill_prob, seed=args.seed)
+    # Shadow-paper only: taker-flatten on SOFT, then re-arm the guard.
+    soft_flat_deadline_s = 1200.0
+    soft_since: Optional[float] = None
+    last_flat_time = time.time()
+
     stop = asyncio.Event()
 
     def _stop(_signum=None, _frame=None):
@@ -442,6 +453,7 @@ async def run(args) -> int:
         action = guard.evaluate(snap.mid, broker.position)
         guard_status = action.value
         guard_state["value"] = guard_status
+
         if action is GuardAction.HARD:
             broker.cancel_all()
             log(f"HARD shadow guard: equity={equity:.4f} start={args.start_equity:.4f} "
@@ -449,6 +461,44 @@ async def run(args) -> int:
             loop.run_once(now, force_heartbeat=True)
             exit_code = 3
             break
+
+        # Shadow-only SOFT taker-flatten: when SOFT, close position with a
+        # market cross and then re-arm the guard (real bot would reduce-only
+        # quote; paper model has no queue priority so we just flatten).
+        if action is GuardAction.SOFT:
+            if soft_since is None:
+                soft_since = now
+                log(f"SOFT guard entered: equity={equity:.4f}, will flatten if not flat after {soft_flat_deadline_s:.0f}s")
+            if broker.position != 0.0 and now - soft_since >= soft_flat_deadline_s:
+                # Taker-flatten at mid (shadow only)
+                flat_px = snap.mid
+                sz = abs(broker.position)
+                fee = flat_px * sz * broker.fee_bps / 1e4
+                if broker.position > 0:
+                    broker.cash += flat_px * sz - fee
+                else:
+                    broker.cash -= flat_px * sz + fee
+                broker.position = 0.0
+                broker.fees += fee
+                broker.fills += 1
+                try:
+                    recorder.on_fill(now, "sell" if broker.position >= 0 else "buy",
+                                     flat_px, sz, fee)
+                except Exception:
+                    pass
+                log(f"SOFT taker-flatten: pos->0 equity={equity:.4f}")
+                # Re-arm: create a fresh LossGuard with the *current* equity as e0.
+                # This mirrors the real bot's behaviour after a successful reduce-only window.
+                guard = LossGuard(
+                    equity,
+                    LossGuardConfig(soft_loss_usd=args.soft_loss_usd,
+                                    hard_loss_usd=args.hard_loss_usd,
+                                    halt_file=args.halt_file),
+                    now=time.time, halt_path=args.halt_file)
+                soft_since = None
+        else:
+            soft_since = None
+
         # 4) one decision step (policy sample + propensity, no exploration in guard)
         micro = SimpleMicro(obi_nw=snap.obi, lead_btc_1s=snap.btc_lead_bps)
         step = recorder.observe(

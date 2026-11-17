@@ -64,8 +64,8 @@ def _parse_ids(raw: str) -> list:
     return ids
 
 
-# Every ID allowed to read the dashboard and send commands.
-AUTH_USER_IDS = {6029973681, 7752127491}
+# Authorized operator IDs, read from TG_ADMIN_ID environment variable.
+AUTH_USER_IDS = set(_parse_ids(os.environ.get("TG_ADMIN_ID", "")))
 
 # Dashboard + alerts fan out to all operators.  TELEGRAM_CHAT_IDS overrides
 # TELEGRAM_CHAT_ID; authorized operators are always included so a newly
